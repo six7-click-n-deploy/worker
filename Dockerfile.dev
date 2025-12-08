@@ -1,0 +1,13 @@
+# Dummy Dockerfile.dev for worker
+# This Dockerfile is intentionally minimal and keeps the container idle
+# so you can run a dev worker container that does nothing yet.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy project files if needed (worker folder is currently empty)
+COPY . /app
+
+# Keep container running but doing nothing
+CMD ["tail", "-f", "/dev/null"]
