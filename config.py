@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     OPENSTACK_CLOUDS_YAML: str = "/app/clouds.yaml"
     OPENSTACK_CLOUD_NAME: str = "openstack"  # Cloud name to use from clouds.yaml
     
+    # OpenStack defaults for Packer builds (DHBW-specific)
+    PACKER_BUILD_FLAVOR: str = "gp1.small"  # Flavor for temporary build instances
+    PACKER_FLOATING_IP_POOL: str = "NAT"  # External network for builds
+    PACKER_BUILD_NETWORK: str = "DHBW"  # Internal network for builds
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

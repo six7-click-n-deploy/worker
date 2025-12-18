@@ -232,20 +232,67 @@ class PackerExecutor:
         env.update(self.env_vars)
         return env
     
-    def validate(self, template_file: str) -> bool:
+    def init(self) -> bool:
+        """
+        Initialize Packer (install required plugins)
+        
+        Returns:
+            bool: True if successful
+        """
+        try:
+            logger.info(f"Running packer init in {self.working_dir}")
+            result = subprocess.run(
+                [self.packer_path, "init", "."],
+                cwd=self.working_dir,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=self._get_env()
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"Packer init failed with return code {result.returncode}")
+                logger.error(f"STDOUT: {result.stdout}")
+                logger.error(f"STDERR: {result.stderr}")
+                return False
+            
+            logger.info("Packer init successful")
+            logger.info(f"Output: {result.stdout}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Packer init error: {e}")
+            return False
+    
+    def validate(self, template_file: str, variables: Optional[Dict[str, Any]] = None) -> bool:
         """
         Validate a Packer template
         
         Args:
             template_file: Path to the Packer template file
+            variables: Dictionary of variables to pass via -var flags
             
         Returns:
             bool: True if valid
         """
         try:
+            cmd = [self.packer_path, "validate"]
+            
+            if variables:
+                for key, value in variables.items():
+                    # Convert lists and dicts to JSON strings for Packer
+                    if isinstance(value, (list, dict)):
+                        value_str = json.dumps(value)
+                    else:
+                        value_str = str(value)
+                    cmd.extend(["-var", f"{key}={value_str}"])
+            
+            cmd.append(template_file)
+            
             logger.info(f"Validating packer template {template_file}")
+            logger.info(f"Command: {' '.join(cmd)}")
             result = subprocess.run(
-                [self.packer_path, "validate", template_file],
+                cmd,
                 cwd=self.working_dir,
                 capture_output=True,
                 text=True,
@@ -254,23 +301,28 @@ class PackerExecutor:
             )
             
             if result.returncode != 0:
-                logger.error(f"Packer validate failed: {result.stderr}")
+                logger.error(f"Packer validate failed with return code {result.returncode}")
+                logger.error(f"STDOUT: {result.stdout}")
+                logger.error(f"STDERR: {result.stderr}")
                 return False
             
             logger.info("Packer template is valid")
+            logger.info(f"Validation output: {result.stdout}")
             return True
             
         except Exception as e:
             logger.error(f"Packer validate error: {e}")
             return False
     
-    def build(self, template_file: str, variables: Optional[Dict[str, Any]] = None) -> bool:
+    def build(self, template_file: str, variables: Optional[Dict[str, Any]] = None, extra_env: Optional[Dict[str, str]] = None, force: bool = True) -> bool:
         """
         Build a Packer image
         
         Args:
             template_file: Path to the Packer template file
-            variables: Dictionary of variables to pass
+            variables: Dictionary of variables to pass via -var flags
+            extra_env: Additional environment variables for the build process
+            force: Force overwrite of existing images (default: True)
             
         Returns:
             bool: True if successful
@@ -278,28 +330,59 @@ class PackerExecutor:
         try:
             cmd = [self.packer_path, "build"]
             
+            # Add -force flag to overwrite existing images
+            if force:
+                cmd.append("-force")
+            
             if variables:
                 for key, value in variables.items():
-                    cmd.extend(["-var", f"{key}={value}"])
+                    # Convert lists and dicts to JSON strings for Packer
+                    if isinstance(value, (list, dict)):
+                        value_str = json.dumps(value)
+                    else:
+                        value_str = str(value)
+                    cmd.extend(["-var", f"{key}={value_str}"])
             
             cmd.append(template_file)
             
+            # Merge environment variables
+            build_env = self._get_env()
+            if extra_env:
+                build_env.update(extra_env)
+            
+            # Enable Packer debug logging
+            build_env['PACKER_LOG'] = '1'
+            
             logger.info(f"Building packer image from {template_file}")
-            result = subprocess.run(
+            logger.info(f"This may take 15-30 minutes...")
+            logger.info(f"Command: {' '.join(cmd)}")
+            
+            # Stream output in real-time for long-running builds
+            process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=3600,  # 1 hour timeout for image builds
-                env=self._get_env()
+                env=build_env
             )
             
-            if result.returncode != 0:
-                logger.error(f"Packer build failed: {result.stderr}")
+            # Stream and log output line by line
+            output_lines = []
+            for line in process.stdout:
+                line = line.rstrip()
+                if line:
+                    logger.info(f"Packer: {line}")
+                    output_lines.append(line)
+            
+            process.wait(timeout=3600)  # 1 hour timeout
+            
+            if process.returncode != 0:
+                logger.error(f"Packer build failed with return code {process.returncode}")
+                logger.error(f"Output: {chr(10).join(output_lines[-50:])}")  # Last 50 lines
                 return False
             
             logger.info("Packer build successful")
-            logger.info(f"Build output: {result.stdout}")
             return True
             
         except subprocess.TimeoutExpired:

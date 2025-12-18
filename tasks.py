@@ -115,10 +115,39 @@ def deploy_application(self, deployment_id: str, app_id: str):
             logger.info("Found Packer template, building image...")
             packer = PackerExecutor(os.path.join(repo_path, "packer"), env_vars=openstack_env)
             
-            if not packer.validate("template.pkr.hcl"):
+            if not packer.init():
+                raise Exception("Packer init failed")
+            
+            # Only pass variables that Packer template defines
+            # Filter out Terraform-specific variables
+            packer_vars = {}
+            
+            # Map network_name to networks list for Packer
+            # if 'network_name' in user_vars:
+            #     packer_vars['networks'] = [user_vars['network_name']]
+            
+            # # Add other known Packer variables
+            # if 'flavor' in user_vars:
+            #     packer_vars['flavor'] = user_vars['flavor']
+            # if 'floating_ip_pool' in user_vars:
+            #     packer_vars['floating_ip_pool'] = user_vars['floating_ip_pool']
+            # if 'image_name' in user_vars:
+            #     packer_vars['image_name'] = user_vars['image_name']
+            # if 'source_image' in user_vars:
+            #     packer_vars['source_image'] = user_vars['source_image']
+            
+            # # Set defaults only if not provided
+            # if 'flavor' not in packer_vars:
+            #     packer_vars['flavor'] = 'gp1.small'
+            # if 'floating_ip_pool' not in packer_vars:
+            #     packer_vars['floating_ip_pool'] = 'NAT'
+            
+            logger.info(f"Packer variables: {packer_vars}")
+            
+            if not packer.validate("template.pkr.hcl", packer_vars):
                 raise Exception("Packer template validation failed")
             
-            if not packer.build("template.pkr.hcl", variables=user_vars):
+            if not packer.build("template.pkr.hcl", packer_vars):
                 raise Exception("Packer build failed")
         
         # Run Terraform
