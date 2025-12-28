@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     wget \
     unzip \
     curl \
+    gcc \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Terraform
@@ -24,9 +26,14 @@ RUN wget https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER
     && mv packer /usr/local/bin/ \
     && rm packer_${PACKER_VERSION}_linux_amd64.zip
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Poetry
+RUN curl -sSL https://install.python-poetry.org | python3 - && \
+    ln -s /root/.local/bin/poetry /usr/local/bin/poetry
+
+# Copy Poetry files and install dependencies
+COPY pyproject.toml ./
+COPY poetry.lock ./
+RUN poetry install --no-root --no-interaction --no-ansi
 
 # Copy application code
 COPY . /app
@@ -34,5 +41,6 @@ COPY . /app
 # Create temp directory for repositories
 RUN mkdir -p /tmp/worker_repos
 
-# Run Celery worker with events enabled (-E flag for Flower monitoring)
-CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=2", "-E"]
+# Hot Reload für Celery Worker im app/-Verzeichnis
+WORKDIR /app
+CMD ["poetry", "run", "watchmedo", "auto-restart", "--directory=app/", "--pattern=*.py", "--recursive", "--", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "-Q", "deployment-*,default", "--prefetch-multiplier=1"]

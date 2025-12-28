@@ -1,0 +1,182 @@
+import os
+import logging
+from typing import Dict, Any
+from .celery_app import celery_app
+from .services import git_service, TerraformExecutor, PackerExecutor, openstack_auth_service
+import redis
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Redis connection for locking
+from .config import settings
+redis_client = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=0)
+LOCK_EXPIRE = 3600  # seconds
+
+def acquire_deployment_lock(deployment_id: str) -> bool:
+    """Try to acquire a lock for a deployment. Returns True if lock acquired."""
+    return redis_client.set(f"deployment:{deployment_id}:lock", 1, nx=True, ex=LOCK_EXPIRE)
+
+def release_deployment_lock(deployment_id: str):
+    """Release the deployment lock."""
+    redis_client.delete(f"deployment:{deployment_id}:lock")
+
+@celery_app.task(bind=True, name="tasks.deploy_application")
+def deploy_application(self, deployment_id: str, app_git_link: str, release: str, user_vars: Dict[str, Any]):
+    """
+    Deploy an application using Terraform and Packer
+    Args:
+        deployment_id: UUID of the deployment
+        app_git_link: Git repo URL
+        release: Tag/Release to checkout
+        user_vars: User variables for Packer/Terraform
+    Returns:
+        dict: status, logs, tf_state, commit_info, terraform_outputs
+    """
+    logs = []
+    repo_path = None
+    tf_state = None
+    outputs = None
+    commit_info = None
+    status = "unknown"
+
+    def log(msg):
+        logger.info(msg)
+        logs.append(msg)
+        self.update_state(state='PROGRESS', meta={'log': msg})
+
+
+    try:
+        log(f"Starting deployment {deployment_id} for release {release}")
+        log("Setting up OpenStack credentials...")
+        openstack_env = openstack_auth_service.get_environment_variables()
+        if not openstack_env or not openstack_env.get('OS_AUTH_URL'):
+            raise Exception("Failed to load OpenStack credentials")
+        log(f"Cloning repository {app_git_link} (release: {release})")
+        repo_path = git_service.clone_repository(
+            git_url=app_git_link,
+            deployment_id=deployment_id,
+            tag=release
+        )
+        commit_info = git_service.get_latest_commit_info(repo_path)
+        log(f"Commit info: {commit_info}")
+        # Packer
+        packer_file = os.path.join(repo_path, "packer", "template.pkr.hcl")
+        if os.path.exists(packer_file):
+            log("Found Packer template, building image...")
+            packer = PackerExecutor(os.path.join(repo_path, "packer"), env_vars=openstack_env)
+            if not packer.init():
+                raise Exception("Packer init failed")
+            packer_vars = {}  # user_vars can be filtered for packer
+            log(f"Packer variables: {packer_vars}")
+            if not packer.validate("template.pkr.hcl", packer_vars):
+                raise Exception("Packer template validation failed")
+            if not packer.build("template.pkr.hcl", packer_vars):
+                raise Exception("Packer build failed")
+        # Terraform
+        terraform_dir = os.path.join(repo_path, "terraform")
+        if not os.path.exists(terraform_dir):
+            raise Exception("No terraform directory found in repository")
+        log("Running Terraform deployment...")
+        terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
+        if not terraform.init():
+            raise Exception("Terraform init failed")
+        if not terraform.plan(variables=user_vars):
+            raise Exception("Terraform plan failed")
+        if not terraform.apply(variables=user_vars):
+            raise Exception("Terraform apply failed")
+        outputs = terraform.output()
+        log(f"Terraform outputs: {outputs}")
+        # Terraform State
+        tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
+        if os.path.exists(tfstate_path):
+            with open(tfstate_path, "r") as f:
+                tf_state = f.read()
+        status = "success"
+        log(f"Deployment {deployment_id} completed successfully")
+        return {
+            "status": status,
+            "deployment_id": deployment_id,
+            "logs": logs,
+            "tf_state": tf_state,
+            "commit_info": commit_info,
+            "terraform_outputs": outputs
+        }
+    except Exception as e:
+        status = "failed"
+        log(f"Deployment {deployment_id} failed: {e}")
+        return {
+            "status": status,
+            "deployment_id": deployment_id,
+            "logs": logs,
+            "tf_state": tf_state,
+            "commit_info": commit_info,
+            "terraform_outputs": outputs
+        }
+    finally:
+        release_deployment_lock(deployment_id)
+        if repo_path:
+            git_service.cleanup_repository(repo_path)
+
+@celery_app.task(bind=True, name="tasks.delete_deployment")
+def delete_deployment(self, deployment_id: str, app_git_link: str, release: str, user_vars: Dict[str, Any]):
+    """
+    Delete/destroy a deployment using Terraform
+    Args:
+        deployment_id: UUID of the deployment
+        app_git_link: Git repo URL
+        release: Tag/Release to checkout
+        user_vars: User variables for Terraform
+    Returns:
+        dict: status, logs
+    """
+    logs = []
+    repo_path = None
+    status = "unknown"
+
+    def log(msg):
+        logger.info(msg)
+        logs.append(msg)
+        self.update_state(state='PROGRESS', meta={'log': msg})
+
+
+    try:
+        log(f"Starting deletion of deployment {deployment_id} (release: {release})")
+        log("Setting up OpenStack credentials...")
+        openstack_env = openstack_auth_service.get_environment_variables()
+        if not openstack_env or not openstack_env.get('OS_AUTH_URL'):
+            raise Exception("Failed to load OpenStack credentials")
+        log(f"Cloning repository {app_git_link} (release: {release})")
+        repo_path = git_service.clone_repository(
+            git_url=app_git_link,
+            deployment_id=deployment_id,
+            tag=release
+        )
+        terraform_dir = os.path.join(repo_path, "terraform")
+        if not os.path.exists(terraform_dir):
+            raise Exception("No terraform directory found in repository")
+        log("Running Terraform destroy...")
+        terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
+        if not terraform.init():
+            raise Exception("Terraform init failed")
+        if not terraform.destroy(variables=user_vars):
+            raise Exception("Terraform destroy failed")
+        status = "success"
+        log(f"Deployment {deployment_id} deleted successfully")
+        return {
+            "status": status,
+            "deployment_id": deployment_id,
+            "logs": logs
+        }
+    except Exception as e:
+        status = "failed"
+        log(f"Deployment deletion {deployment_id} failed: {e}")
+        return {
+            "status": status,
+            "deployment_id": deployment_id,
+            "logs": logs
+        }
+    finally:
+        release_deployment_lock(deployment_id)
+        if repo_path:
+            git_service.cleanup_repository(repo_path)

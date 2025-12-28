@@ -1,12 +1,12 @@
+from .config import settings
 from celery import Celery
-from config import settings
 
 # Initialize Celery app
 celery_app = Celery(
     "worker",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["tasks"]
+    include=["app.tasks"]
 )
 
 # Celery configuration

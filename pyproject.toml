@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "worker"
+version = "0.1.0"
+description = "Celery Worker für Click-n-Deploy"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = {text = "Apache 2.0"}
+authors = [
+    "Dein Name <dein@email.de>"
+]
+keywords = ["celery", "redis", "terraform", "packer", "git", "worker"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.12"
+celery = {extras = ["redis"], version = "^5.3.4"}
+sqlalchemy = "^2.0.23"
+psycopg2-binary = "^2.9.9"
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+gitpython = "^3.1.40"
+python-dotenv = "^1.0.0"
+pyyaml = "^6.0.1"
+watchdog = "^4.0"
+redis = "^5.0.0"
+
+[tool.poetry.dev-dependencies]
+black = "^24.0"
+ruff = "^0.1"
+pytest = "^7.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
