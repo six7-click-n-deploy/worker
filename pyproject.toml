@@ -2,9 +2,7 @@
 name = "worker"
 version = "0.1.0"
 description = "Celery Worker für Click-n-Deploy"
-readme = "README.md"
-requires-python = ">=3.10,<3.12"
-license = {text = "Apache 2.0"}
+license = "Apache-2.0"
 authors = [
     "Dein Name <dein@email.de>"
 ]
@@ -36,5 +34,4 @@ ruff = "^0.1"
 pytest = "^7.0"
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
