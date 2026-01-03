@@ -35,11 +35,10 @@ COPY pyproject.toml ./
 RUN poetry install --no-root --no-interaction --no-ansi
 
 # Copy application code
-COPY . /app
+COPY . .
 
 # Create temp directory for repositories
 RUN mkdir -p /tmp/worker_repos
 
-# Hot Reload für Celery Worker im app/-Verzeichnis
-WORKDIR /app
-CMD ["poetry", "run", "watchmedo", "auto-restart", "--directory=app/", "--pattern=*.py", "--recursive", "--", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "-Q", "deployment-*,default", "--prefetch-multiplier=1"]
+# Starte Celery Worker mit poetry run
+CMD ["poetry", "run", "celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--autoscale=2,20", "-E", "--prefetch-multiplier=1"]

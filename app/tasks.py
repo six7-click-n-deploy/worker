@@ -3,23 +3,9 @@ import logging
 from typing import Dict, Any
 from .celery_app import celery_app
 from .services import git_service, TerraformExecutor, PackerExecutor, openstack_auth_service
-import redis
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Redis connection for locking
-from .config import settings
-redis_client = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=0)
-LOCK_EXPIRE = 3600  # seconds
-
-def acquire_deployment_lock(deployment_id: str) -> bool:
-    """Try to acquire a lock for a deployment. Returns True if lock acquired."""
-    return redis_client.set(f"deployment:{deployment_id}:lock", 1, nx=True, ex=LOCK_EXPIRE)
-
-def release_deployment_lock(deployment_id: str):
-    """Release the deployment lock."""
-    redis_client.delete(f"deployment:{deployment_id}:lock")
 
 @celery_app.task(bind=True, name="tasks.deploy_application")
 def deploy_application(self, deployment_id: str, app_git_link: str, release: str, user_vars: Dict[str, Any]):
@@ -53,13 +39,11 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
         if not openstack_env or not openstack_env.get('OS_AUTH_URL'):
             raise Exception("Failed to load OpenStack credentials")
         log(f"Cloning repository {app_git_link} (release: {release})")
-        repo_path = git_service.clone_repository(
+        repo_path = git_service.clone_release(
             git_url=app_git_link,
             deployment_id=deployment_id,
             tag=release
         )
-        commit_info = git_service.get_latest_commit_info(repo_path)
-        log(f"Commit info: {commit_info}")
         # Packer
         packer_file = os.path.join(repo_path, "packer", "template.pkr.hcl")
         if os.path.exists(packer_file):
@@ -114,7 +98,6 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
             "terraform_outputs": outputs
         }
     finally:
-        release_deployment_lock(deployment_id)
         if repo_path:
             git_service.cleanup_repository(repo_path)
 
@@ -177,6 +160,5 @@ def delete_deployment(self, deployment_id: str, app_git_link: str, release: str,
             "logs": logs
         }
     finally:
-        release_deployment_lock(deployment_id)
         if repo_path:
             git_service.cleanup_repository(repo_path)
