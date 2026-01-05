@@ -6,12 +6,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     
     # Celery
-    CELERY_BROKER_URL: str = "redis://redis:6379/0"
-    CELERY_RESULT_BACKEND: str = "redis://redis:6379/1"
-    
-    # Redis for locking
-    REDIS_HOST: str = "redis"
-    REDIS_PORT: int = 6379
+    CELERY_BROKER_URL: str = "amqp://admin:admin@rabbitmq:5672/"
     
     # Worker settings
     TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"

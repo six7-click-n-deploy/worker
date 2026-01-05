@@ -1,25 +1,21 @@
 from .config import settings
 from celery import Celery
 
-# Initialize Celery app
 celery_app = Celery(
     "worker",
     broker=settings.CELERY_BROKER_URL,
-    backend=settings.CELERY_RESULT_BACKEND,
     include=["app.tasks"]
 )
 
-# Celery configuration
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
     task_track_started=True,
-    task_time_limit=3600,  # 1 hour max per task
+    task_acks_late=True,
     worker_prefetch_multiplier=1,
-    worker_max_tasks_per_child=50,
+    worker_send_task_events=True,
+    task_send_sent_event=True,
 )
 
 if __name__ == "__main__":
