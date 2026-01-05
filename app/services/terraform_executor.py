@@ -28,11 +28,11 @@ class TerraformExecutor:
         env['TF_LOG'] = 'DEBUG'  # Always enable Terraform debug logging
         return env
 
-    def init(self) -> bool:
+    def init(self) -> tuple[bool, str, str]:
         """
         Initialize Terraform in the working directory
         Returns:
-            bool: True if successful
+            tuple: (success, stdout, stderr)
         """
         logger.info(f"[TerraformExecutor] INIT: working_dir={self.working_dir}, terraform_path={self.terraform_path}")
         try:
@@ -50,26 +50,27 @@ class TerraformExecutor:
             )
             logger.info(f"[TerraformExecutor] INIT STDOUT: {result.stdout}")
             logger.info(f"[TerraformExecutor] INIT STDERR: {result.stderr}")
-            if result.returncode != 0:
+            success = result.returncode == 0
+            if not success:
                 logger.error(f"[TerraformExecutor] INIT FAILED: returncode={result.returncode}")
-                return False
-            logger.info("[TerraformExecutor] INIT SUCCESSFUL")
-            return True
+            else:
+                logger.info("[TerraformExecutor] INIT SUCCESSFUL")
+            return success, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
             logger.error("[TerraformExecutor] INIT TIMEOUT")
-            return False
+            return False, "", "Terraform init timed out after 5 minutes"
         except Exception as e:
             logger.error(f"[TerraformExecutor] INIT ERROR: {e}")
-            return False
+            return False, "", str(e)
 
-    def plan(self, var_file: Optional[str] = None, variables: Optional[Dict[str, Any]] = None) -> bool:
+    def plan(self, var_file: Optional[str] = None, variables: Optional[Dict[str, Any]] = None) -> tuple[bool, str, str]:
         """
         Run terraform plan
         Args:
             var_file: Path to tfvars file
             variables: Dictionary of variables to pass
         Returns:
-            bool: True if successful
+            tuple: (success, stdout, stderr)
         """
         logger.info(f"[TerraformExecutor] PLAN: working_dir={self.working_dir}, var_file={var_file}")
         try:
@@ -93,23 +94,24 @@ class TerraformExecutor:
             )
             logger.info(f"[TerraformExecutor] PLAN STDOUT: {result.stdout}")
             logger.info(f"[TerraformExecutor] PLAN STDERR: {result.stderr}")
-            if result.returncode != 0:
+            success = result.returncode == 0
+            if not success:
                 logger.error(f"[TerraformExecutor] PLAN FAILED: returncode={result.returncode}")
-                return False
-            logger.info("[TerraformExecutor] PLAN SUCCESSFUL")
-            return True
+            else:
+                logger.info("[TerraformExecutor] PLAN SUCCESSFUL")
+            return success, result.stdout, result.stderr
         except Exception as e:
             logger.error(f"[TerraformExecutor] PLAN ERROR: {e}")
-            return False
+            return False, "", str(e)
 
-    def apply(self, var_file: Optional[str] = None, variables: Optional[Dict[str, Any]] = None) -> bool:
+    def apply(self, var_file: Optional[str] = None, variables: Optional[Dict[str, Any]] = None) -> tuple[bool, str, str]:
         """
         Run terraform apply
         Args:
             var_file: Path to tfvars file
             variables: Dictionary of variables to pass
         Returns:
-            bool: True if successful
+            tuple: (success, stdout, stderr)
         """
         logger.info(f"[TerraformExecutor] APPLY: working_dir={self.working_dir}, var_file={var_file}")
         try:
@@ -133,26 +135,27 @@ class TerraformExecutor:
             )
             logger.info(f"[TerraformExecutor] APPLY STDOUT: {result.stdout}")
             logger.info(f"[TerraformExecutor] APPLY STDERR: {result.stderr}")
-            if result.returncode != 0:
+            success = result.returncode == 0
+            if not success:
                 logger.error(f"[TerraformExecutor] APPLY FAILED: returncode={result.returncode}")
-                return False
-            logger.info("[TerraformExecutor] APPLY SUCCESSFUL")
-            return True
+            else:
+                logger.info("[TerraformExecutor] APPLY SUCCESSFUL")
+            return success, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
             logger.error("[TerraformExecutor] APPLY TIMEOUT")
-            return False
+            return False, "", "Terraform apply timed out after 30 minutes"
         except Exception as e:
             logger.error(f"[TerraformExecutor] APPLY ERROR: {e}")
-            return False
+            return False, "", str(e)
 
-    def destroy(self, var_file: Optional[str] = None, variables: Optional[Dict[str, Any]] = None) -> bool:
+    def destroy(self, var_file: Optional[str] = None, variables: Optional[Dict[str, Any]] = None) -> tuple[bool, str, str]:
         """
         Run terraform destroy
         Args:
             var_file: Path to tfvars file
             variables: Dictionary of variables to pass
         Returns:
-            bool: True if successful
+            tuple: (success, stdout, stderr)
         """
         logger.info(f"[TerraformExecutor] DESTROY: working_dir={self.working_dir}, var_file={var_file}")
         try:
@@ -176,17 +179,18 @@ class TerraformExecutor:
             )
             logger.info(f"[TerraformExecutor] DESTROY STDOUT: {result.stdout}")
             logger.info(f"[TerraformExecutor] DESTROY STDERR: {result.stderr}")
-            if result.returncode != 0:
+            success = result.returncode == 0
+            if not success:
                 logger.error(f"[TerraformExecutor] DESTROY FAILED: returncode={result.returncode}")
-                return False
-            logger.info("[TerraformExecutor] DESTROY SUCCESSFUL")
-            return True
+            else:
+                logger.info("[TerraformExecutor] DESTROY SUCCESSFUL")
+            return success, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
             logger.error("[TerraformExecutor] DESTROY TIMEOUT")
-            return False
+            return False, "", "Terraform destroy timed out after 30 minutes"
         except Exception as e:
             logger.error(f"[TerraformExecutor] DESTROY ERROR: {e}")
-            return False
+            return False, "", str(e)
 
     def output(self) -> Optional[Dict[str, Any]]:
         """

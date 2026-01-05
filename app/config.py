@@ -7,7 +7,6 @@ class Settings(BaseSettings):
     
     # Celery
     CELERY_BROKER_URL: str = "amqp://admin:admin@rabbitmq:5672/"
-    CELERY_RESULT_BACKEND: str = "redis://redis:6379/0"
     
     # Worker settings
     TEMP_REPO_BASE_PATH: str = "/tmp/worker_repos"
