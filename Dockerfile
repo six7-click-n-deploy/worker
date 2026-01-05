@@ -47,19 +47,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Terraform installieren (platform-aware)
-RUN ARCH=$(echo ${TARGETARCH} | sed 's/amd64/amd64/;s/arm64/arm64/') && \
+RUN ARCH="${TARGETARCH:-amd64}" && \
+    echo "Installing Terraform ${TERRAFORM_VERSION} for ${ARCH}" && \
     wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
-    unzip -q terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
+    unzip -qo terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
     mv terraform /usr/local/bin/ && \
-    rm terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip && \
+    rm -f terraform_${TERRAFORM_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
     terraform --version
 
 # Packer installieren (platform-aware)
-RUN ARCH=$(echo ${TARGETARCH} | sed 's/amd64/amd64/;s/arm64/arm64/') && \
+RUN ARCH="${TARGETARCH:-amd64}" && \
+    echo "Installing Packer ${PACKER_VERSION} for ${ARCH}" && \
     wget -q https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
-    unzip -q packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
+    unzip -qo packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
     mv packer /usr/local/bin/ && \
-    rm packer_${PACKER_VERSION}_linux_${ARCH}.zip && \
+    rm -f packer_${PACKER_VERSION}_linux_${ARCH}.zip LICENSE.txt && \
     packer --version
 
 # Virtual Environment vom Builder kopieren
