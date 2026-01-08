@@ -1,28 +1,28 @@
 import os
-import logging
 import json
-from typing import Dict, Any, Optional, List
-from datetime import datetime
+from typing import Dict, Any, Optional
 from .celery_app import celery_app
 from .services import git_service, TerraformExecutor, PackerExecutor, openstack_auth_service
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from .utils.logger import get_logger, LogCategory
 
 
-class DeploymentFailure(Exception):
+logger = get_logger(__name__)
+
+
+class Failure(Exception):
     """Custom exception that carries deployment details for Celery"""
+    
     def __init__(
         self,
         message: str,
         deployment_id: str,
-        logs: List[str],
+        logs_dict: Dict[str, Any],
         tf_state: Optional[str] = None,
-        commit_info: Optional[str] = None,
+        commit_info: Optional[Dict[str, Any]] = None,
         terraform_outputs: Optional[Dict[str, Any]] = None
     ):
         self.deployment_id = deployment_id
-        self.logs = logs
+        self.logs_dict = logs_dict
         self.tf_state = tf_state
         self.commit_info = commit_info
         self.terraform_outputs = terraform_outputs
@@ -31,7 +31,7 @@ class DeploymentFailure(Exception):
         data = {
             "error": message,
             "deployment_id": deployment_id,
-            "logs": logs,
+            "logs": logs_dict,
             "tf_state": tf_state,
             "commit_info": commit_info,
             "terraform_outputs": terraform_outputs
@@ -56,57 +56,69 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
     Returns:
         dict: status, logs, tf_state, commit_info, terraform_outputs
     """
-    logs = []
+    task_logger = get_logger(f"deploy:{deployment_id}")
     repo_path = None
     tf_state = None
     outputs = None
     commit_info = None
-    status = "unknown"
     terraform_dir = None
 
-    def log(msg):
-        """Log message"""
-        timestamp = datetime.utcnow().isoformat()
-        logger.info(msg)
-        logs.append({"timestamp": timestamp, "message": msg})
-    
     def collect_terraform_state():
         """Try to collect terraform state even on failure"""
-        if terraform_dir:
+        if terraform_dir and os.path.exists(terraform_dir):
             tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
             if os.path.exists(tfstate_path):
                 try:
                     with open(tfstate_path, "r") as f:
                         return f.read()
                 except Exception as e:
-                    log(f"Warning: Could not read terraform state: {e}")
+                    task_logger.warning(
+                        f"Could not read terraform state: {e}",
+                        category=LogCategory.WARNING
+                    )
         return None
     
     def collect_terraform_outputs():
         """Try to collect terraform outputs even on partial success"""
-        if terraform_dir:
+        if terraform_dir and os.path.exists(terraform_dir):
             try:
                 terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
                 return terraform.output()
             except Exception as e:
-                log(f"Warning: Could not read terraform outputs: {e}")
+                task_logger.warning(
+                    f"Could not read terraform outputs: {e}",
+                    category=LogCategory.WARNING
+                )
         return None
 
     try:
-        log(f"Starting deployment {deployment_id} for release {release}")
+        task_logger.phase("Starting Deployment")
+        task_logger.resource_info(
+            "deployment",
+            deployment_id,
+            release=release,
+            git_url=app_git_link
+        )
         
         # Phase 1: OpenStack credentials
-        log("Setting up OpenStack credentials...")
+        task_logger.phase("OpenStack Setup")
+        task_logger.operation_start("openstack_auth")
         try:
             openstack_env = openstack_auth_service.get_environment_variables()
             if not openstack_env or not openstack_env.get('OS_AUTH_URL'):
-                raise Exception("OpenStack credentials not configured or missing OS_AUTH_URL")
-            log("✓ OpenStack credentials loaded successfully")
+                raise Exception("OpenStack credentials not configured")
+            task_logger.operation_end("openstack_auth", success=True)
+            task_logger.success(
+                "OpenStack credentials loaded",
+                category=LogCategory.STATUS
+            )
         except Exception as e:
-            raise Exception(f"OpenStack credentials error: {str(e)}")
+            task_logger.operation_end("openstack_auth", success=False)
+            raise Exception(f"OpenStack error: {str(e)}")
         
         # Phase 2: Git clone
-        log(f"Cloning repository {app_git_link} (release: {release})")
+        task_logger.phase("Git Repository Setup")
+        task_logger.info(f"Cloning repository: {app_git_link}", category=LogCategory.OPERATION)
         try:
             repo_path = git_service.clone_release(
                 git_url=app_git_link,
@@ -125,9 +137,22 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
                     "author": str(commit.author),
                     "date": commit.committed_datetime.isoformat()
                 }
-                log(f"✓ Repository cloned at commit {commit.hexsha[:8]}")
+                task_logger.resource_info(
+                    "git_commit",
+                    commit.hexsha[:8],
+                    hash=commit.hexsha,
+                    message=commit.message.strip(),
+                    author=str(commit.author)
+                )
+                task_logger.success(
+                    f"Repository cloned at commit {commit.hexsha[:8]}",
+                    category=LogCategory.STATUS
+                )
             except Exception as e:
-                log(f"Warning: Could not extract commit info: {e}")
+                task_logger.warning(
+                    f"Could not extract commit info: {e}",
+                    category=LogCategory.WARNING
+                )
                 
         except Exception as e:
             raise Exception(f"Git clone failed: {str(e)}")
@@ -135,108 +160,84 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
         # Phase 3: Packer (optional)
         packer_file = os.path.join(repo_path, "packer", "template.pkr.hcl")
         if os.path.exists(packer_file):
-            log("Found Packer template, building image...")
+            task_logger.phase("Packer Image Build")
             try:
                 packer = PackerExecutor(os.path.join(repo_path, "packer"), env_vars=openstack_env)
                 
-                log("Running packer init...")
+                task_logger.info("Initializing Packer plugins...", category=LogCategory.OPERATION)
                 success, stdout, stderr = packer.init()
                 if stdout:
-                    log(f"Packer init output:\\n{stdout}")
-                if stderr:
-                    log(f"Packer init errors:\\n{stderr}")
+                    task_logger.command_output("packer_init_stdout", stdout, success=success)
+                if stderr and not success:
+                    task_logger.warning(f"Packer init stderr:\n{stderr}", category=LogCategory.WARNING)
                 if not success:
                     raise Exception("Packer init failed")
                 
-                packer_vars = {}  # user_vars can be filtered for packer
-                log(f"Packer variables: {packer_vars}")
-                
-                log("Validating packer template...")
-                success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
-                if stdout:
-                    log(f"Packer validate output:\\n{stdout}")
-                if stderr:
-                    log(f"Packer validate errors:\\n{stderr}")
+                task_logger.info("Validating Packer template...", category=LogCategory.OPERATION)
+                success, stdout, stderr = packer.validate("template.pkr.hcl", {})
                 if not success:
-                    raise Exception("Packer template validation failed")
+                    raise Exception(f"Packer validation failed: {stderr}")
                 
-                log("Building image with packer (this may take several minutes)...")
-                success, output = packer.build("template.pkr.hcl", packer_vars)
-                if output:
-                    # Log only last 100 lines to avoid huge logs
-                    lines = output.split("\\n")
-                    if len(lines) > 100:
-                        log(f"Packer build output (last 100 lines):\\n{chr(10).join(lines[-100:])}")
-                    else:
-                        log(f"Packer build output:\\n{output}")
+                task_logger.info(
+                    "Building Docker image (this may take several minutes)...",
+                    category=LogCategory.STATUS
+                )
+                success, output = packer.build("template.pkr.hcl", {})
                 if not success:
-                    raise Exception("Packer build failed")
+                    raise Exception(f"Packer build failed: {output}")
                 
-                log("✓ Packer image built successfully")
+                task_logger.success(
+                    "Packer image built successfully",
+                    category=LogCategory.STATUS
+                )
             except Exception as e:
                 raise Exception(f"Packer error: {str(e)}")
         else:
-            log("No Packer template found, skipping image build")
+            task_logger.info(
+                "No Packer template found, skipping image build",
+                category=LogCategory.SYSTEM
+            )
         
         # Phase 4: Terraform
+        task_logger.phase("Terraform Deployment")
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
         
-        log("Running Terraform deployment...")
         try:
             terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
             
-            log("Running terraform init...")
+            task_logger.info("Initializing Terraform...", category=LogCategory.OPERATION)
             success, stdout, stderr = terraform.init()
-            if stdout:
-                # Truncate long outputs
-                lines = stdout.split("\n")
-                if len(lines) > 50:
-                    log(f"Terraform init output (last 50 lines):\n{chr(10).join(lines[-50:])}")
-                else:
-                    log(f"Terraform init output:\n{stdout}")
-            if stderr:
-                log(f"Terraform init stderr:\n{stderr}")
             if not success:
                 raise Exception("Terraform init failed")
+            task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
             
-            log("Running terraform plan...")
+            task_logger.info("Planning Terraform deployment...", category=LogCategory.OPERATION)
             success, stdout, stderr = terraform.plan(variables=user_vars)
-            if stdout:
-                # Plan output can be huge, truncate intelligently
-                lines = stdout.split("\n")
-                if len(lines) > 100:
-                    log(f"Terraform plan output (last 100 lines):\n{chr(10).join(lines[-100:])}")
-                else:
-                    log(f"Terraform plan output:\n{stdout}")
-            if stderr:
-                log(f"Terraform plan stderr:\n{stderr}")
             if not success:
                 raise Exception("Terraform plan failed")
+            task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
             
-            log("Running terraform apply (this may take several minutes)...")
+            task_logger.info(
+                "Applying Terraform configuration (this may take several minutes)...",
+                category=LogCategory.STATUS
+            )
             success, stdout, stderr = terraform.apply(variables=user_vars)
-            if stdout:
-                # Apply output shows resource creation, keep more of it
-                lines = stdout.split("\n")
-                if len(lines) > 200:
-                    log(f"Terraform apply output (last 200 lines):\n{chr(10).join(lines[-200:])}")
-                else:
-                    log(f"Terraform apply output:\n{stdout}")
-            if stderr:
-                log(f"Terraform apply stderr:\n{stderr}")
             if not success:
                 raise Exception("Terraform apply failed")
-            
-            log("✓ Terraform apply completed")
+            task_logger.success("Terraform resources created", category=LogCategory.STATUS)
             
             # Collect outputs and state
             outputs = collect_terraform_outputs()
             tf_state = collect_terraform_state()
             
             if outputs:
-                log(f"Terraform outputs: {outputs}")
+                task_logger.info(
+                    f"Terraform deployment outputs collected",
+                    category=LogCategory.OPERATION,
+                    output_count=len(outputs)
+                )
             
         except Exception as e:
             # Try to collect partial results even on failure
@@ -244,23 +245,36 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
             outputs = collect_terraform_outputs()
             raise Exception(f"Terraform error: {str(e)}")
         
-        status = "success"
-        log(f"✓ Deployment {deployment_id} completed successfully")
+        task_logger.phase("Deployment Complete")
+        task_logger.success(
+            f"Deployment {deployment_id} completed successfully",
+            category=LogCategory.STATUS
+        )
+        
+        # Log summary
+        summary = task_logger.get_summary()
+        task_logger.info(
+            f"Deployment summary",
+            category=LogCategory.SYSTEM,
+            **summary
+        )
         
         # Return result (sent via task-succeeded event)
         return {
-            "status": status,
+            "status": "success",
             "deployment_id": deployment_id,
-            "logs": logs,
+            "logs": task_logger.get_logs_dict(),
             "tf_state": tf_state,
             "commit_info": commit_info,
             "terraform_outputs": outputs
         }
         
     except Exception as e:
-        status = "failed"
-        error_msg = str(e)
-        log(f"✗ Deployment {deployment_id} failed: {error_msg}")
+        task_logger.exception(
+            f"Deployment failed: {str(e)}",
+            exception=e,
+            deployment_id=deployment_id
+        )
         
         # Try to collect any available state/outputs even on failure
         if not tf_state:
@@ -268,11 +282,11 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
         if not outputs:
             outputs = collect_terraform_outputs()
         
-        # Raise custom exception with all details - Celery will send task-failed event
-        raise DeploymentFailure(
-            message=error_msg,
+        # Raise custom exception with all details
+        raise Failure(
+            message=str(e),
             deployment_id=deployment_id,
-            logs=logs,
+            logs_dict=task_logger.get_logs_dict(),
             tf_state=tf_state,
             commit_info=commit_info,
             terraform_outputs=outputs
@@ -282,9 +296,15 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
         if repo_path:
             try:
                 git_service.cleanup_repository(repo_path)
-                log("✓ Repository cleanup completed")
+                task_logger.success(
+                    "Repository cleanup completed",
+                    category=LogCategory.SYSTEM
+                )
             except Exception as e:
-                log(f"Warning: Repository cleanup failed: {e}")
+                task_logger.warning(
+                    f"Repository cleanup failed: {e}",
+                    category=LogCategory.WARNING
+                )
 
 @celery_app.task(bind=True, name="tasks.delete_deployment")
 def delete_deployment(self, deployment_id: str, app_git_link: str, release: str, user_vars: Dict[str, Any]):
@@ -300,91 +320,83 @@ def delete_deployment(self, deployment_id: str, app_git_link: str, release: str,
     Returns:
         dict: status, logs, tf_state
     """
-    logs = []
+    task_logger = get_logger(f"delete:{deployment_id}")
     repo_path = None
-    status = "unknown"
     tf_state = None
     terraform_dir = None
 
-    def log(msg):
-        """Log message"""
-        timestamp = datetime.utcnow().isoformat()
-        logger.info(msg)
-        logs.append({"timestamp": timestamp, "message": msg})
-    
     def collect_terraform_state():
         """Try to collect terraform state"""
-        if terraform_dir:
+        if terraform_dir and os.path.exists(terraform_dir):
             tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
             if os.path.exists(tfstate_path):
                 try:
                     with open(tfstate_path, "r") as f:
                         return f.read()
                 except Exception as e:
-                    log(f"Warning: Could not read terraform state: {e}")
+                    task_logger.warning(
+                        f"Could not read terraform state: {e}",
+                        category=LogCategory.WARNING
+                    )
         return None
 
     try:
-        log(f"Starting deletion of deployment {deployment_id} (release: {release})")
+        task_logger.phase("Starting Destruction")
+        task_logger.resource_info(
+            "deployment_deletion",
+            deployment_id,
+            release=release
+        )
         
         # Phase 1: OpenStack credentials
-        log("Setting up OpenStack credentials...")
+        task_logger.phase("OpenStack Setup")
+        task_logger.operation_start("openstack_auth")
         try:
             openstack_env = openstack_auth_service.get_environment_variables()
             if not openstack_env or not openstack_env.get('OS_AUTH_URL'):
-                raise Exception("OpenStack credentials not configured or missing OS_AUTH_URL")
-            log("✓ OpenStack credentials loaded successfully")
+                raise Exception("OpenStack credentials not configured")
+            task_logger.operation_end("openstack_auth", success=True)
+            task_logger.success("OpenStack credentials loaded", category=LogCategory.STATUS)
         except Exception as e:
-            raise Exception(f"OpenStack credentials error: {str(e)}")
+            task_logger.operation_end("openstack_auth", success=False)
+            raise Exception(f"OpenStack error: {str(e)}")
         
         # Phase 2: Git clone
-        log(f"Cloning repository {app_git_link} (release: {release})")
+        task_logger.phase("Git Repository Setup")
+        task_logger.info(f"Cloning repository: {app_git_link}", category=LogCategory.OPERATION)
         try:
             repo_path = git_service.clone_release(
                 git_url=app_git_link,
                 deployment_id=deployment_id,
                 tag=release
             )
-            log("✓ Repository cloned successfully")
+            task_logger.success("Repository cloned successfully", category=LogCategory.STATUS)
         except Exception as e:
             raise Exception(f"Git clone failed: {str(e)}")
         
         # Phase 3: Terraform destroy
+        task_logger.phase("Terraform Destruction")
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
-            raise Exception(f"Terraform directory not found at {terraform_dir}")
+            raise Exception(f"Terraform directory not found")
         
-        log("Running Terraform destroy...")
         try:
             terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
             
-            log("Running terraform init...")
+            task_logger.info("Initializing Terraform...", category=LogCategory.OPERATION)
             success, stdout, stderr = terraform.init()
-            if stdout:
-                lines = stdout.split("\n")
-                if len(lines) > 50:
-                    log(f"Terraform init output (last 50 lines):\n{chr(10).join(lines[-50:])}")
-                else:
-                    log(f"Terraform init output:\n{stdout}")
-            if stderr:
-                log(f"Terraform init stderr:\n{stderr}")
             if not success:
                 raise Exception("Terraform init failed")
+            task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
             
-            log("Running terraform destroy (this may take several minutes)...")
+            task_logger.info(
+                "Destroying all infrastructure (this may take several minutes)...",
+                category=LogCategory.STATUS
+            )
             success, stdout, stderr = terraform.destroy(variables=user_vars)
-            if stdout:
-                lines = stdout.split("\n")
-                if len(lines) > 150:
-                    log(f"Terraform destroy output (last 150 lines):\n{chr(10).join(lines[-150:])}")
-                else:
-                    log(f"Terraform destroy output:\n{stdout}")
-            if stderr:
-                log(f"Terraform destroy stderr:\n{stderr}")
             if not success:
                 raise Exception("Terraform destroy failed")
-            
-            log("✓ Terraform destroy completed")
+            task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
             
             # Collect final state
             tf_state = collect_terraform_state()
@@ -394,30 +406,43 @@ def delete_deployment(self, deployment_id: str, app_git_link: str, release: str,
             tf_state = collect_terraform_state()
             raise Exception(f"Terraform destroy error: {str(e)}")
         
-        status = "success"
-        log(f"✓ Deployment {deployment_id} deleted successfully")
+        task_logger.phase("Destruction Complete")
+        task_logger.success(
+            f"Deployment {deployment_id} destroyed successfully",
+            category=LogCategory.STATUS
+        )
+        
+        # Log summary
+        summary = task_logger.get_summary()
+        task_logger.info(
+            f"Destruction summary",
+            category=LogCategory.SYSTEM,
+            **summary
+        )
         
         return {
-            "status": status,
+            "status": "success",
             "deployment_id": deployment_id,
-            "logs": logs,
+            "logs": task_logger.get_logs_dict(),
             "tf_state": tf_state
         }
         
     except Exception as e:
-        status = "failed"
-        error_msg = str(e)
-        log(f"✗ Deployment deletion {deployment_id} failed: {error_msg}")
+        task_logger.exception(
+            f"Destruction failed: {str(e)}",
+            exception=e,
+            deployment_id=deployment_id
+        )
         
         # Try to collect state even on failure
         if not tf_state:
             tf_state = collect_terraform_state()
         
-        # Raise custom exception - Celery will send task-failed event
-        raise DeploymentFailure(
-            message=error_msg,
+        # Raise custom exception
+        raise Failure(
+            message=str(e),
             deployment_id=deployment_id,
-            logs=logs,
+            logs_dict=task_logger.get_logs_dict(),
             tf_state=tf_state,
             commit_info=None,
             terraform_outputs=None
@@ -427,7 +452,13 @@ def delete_deployment(self, deployment_id: str, app_git_link: str, release: str,
         if repo_path:
             try:
                 git_service.cleanup_repository(repo_path)
-                log("✓ Repository cleanup completed")
+                task_logger.success(
+                    "Repository cleanup completed",
+                    category=LogCategory.SYSTEM
+                )
             except Exception as e:
-                log(f"Warning: Repository cleanup failed: {e}")
+                task_logger.warning(
+                    f"Repository cleanup failed: {e}",
+                    category=LogCategory.WARNING
+                )
 
