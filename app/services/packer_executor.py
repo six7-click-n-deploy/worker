@@ -1,18 +1,18 @@
 """
-Packer execution utilities
+Packer execution utilities with comprehensive structured logging
 """
 import os
 import subprocess
-import logging
 import json
 from typing import Optional, Dict, Any
 from ..config import settings
+from ..utils.logger import get_logger, LogCategory
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class PackerExecutor:
-    """Executor for Packer operations"""
+    """Executor for Packer operations with detailed logging"""
 
     def __init__(self, working_dir: str, env_vars: Optional[Dict[str, str]] = None):
         self.working_dir = working_dir
@@ -25,7 +25,7 @@ class PackerExecutor:
         env.update(self.env_vars)
         if extra_env:
             env.update(extra_env)
-        env['PACKER_LOG'] = '1'  # Always enable Packer debug logging
+        env['PACKER_LOG'] = '1'
         return env
 
     def init(self) -> tuple[bool, str, str]:
@@ -34,30 +34,41 @@ class PackerExecutor:
         Returns:
             tuple: (success, stdout, stderr)
         """
-        logger.info(f"[PackerExecutor] INIT: working_dir={self.working_dir}, packer_path={self.packer_path}")
+        logger.operation_start("packer_init", working_dir=self.working_dir)
         try:
-            env = self._get_env()
-            logger.debug(f"[PackerExecutor] ENV: {json.dumps(env, indent=2)}")
             cmd = [self.packer_path, "init", "."]
-            logger.info(f"[PackerExecutor] CMD: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd,
                 cwd=self.working_dir,
                 capture_output=True,
                 text=True,
                 timeout=300,
-                env=env
+                env=self._get_env()
             )
-            logger.info(f"[PackerExecutor] INIT STDOUT: {result.stdout}")
-            logger.info(f"[PackerExecutor] INIT STDERR: {result.stderr}")
             success = result.returncode == 0
+            
+            if result.stdout:
+                logger.command_output("packer_init", result.stdout, result.returncode)
+            
             if not success:
-                logger.error(f"[PackerExecutor] INIT FAILED: returncode={result.returncode}")
+                logger.error(
+                    f"Packer init failed",
+                    category=LogCategory.ERROR,
+                    returncode=result.returncode,
+                    stderr=result.stderr[:1000]  # First 1000 chars
+                )
             else:
-                logger.info("[PackerExecutor] INIT SUCCESSFUL")
+                logger.success("Packer init completed", category=LogCategory.STATUS)
+            
+            logger.operation_end("packer_init", success)
             return success, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            logger.error("Packer init timed out after 5 minutes", category=LogCategory.ERROR)
+            logger.operation_end("packer_init", success=False)
+            return False, "", "Timeout"
         except Exception as e:
-            logger.error(f"[PackerExecutor] INIT ERROR: {e}")
+            logger.exception("Packer init failed with exception", exception=e)
+            logger.operation_end("packer_init", success=False)
             return False, "", str(e)
 
     def validate(self, template_file: str, variables: Optional[Dict[str, Any]] = None) -> tuple[bool, str, str]:
@@ -69,36 +80,43 @@ class PackerExecutor:
         Returns:
             tuple: (success, stdout, stderr)
         """
-        logger.info(f"[PackerExecutor] VALIDATE: template_file={template_file}, working_dir={self.working_dir}")
+        logger.operation_start("packer_validate", template=template_file)
         try:
             cmd = [self.packer_path, "validate"]
             if variables:
-                logger.info(f"[PackerExecutor] VALIDATE VARIABLES: {json.dumps(variables, indent=2)}")
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
             cmd.append(template_file)
-            env = self._get_env()
-            logger.debug(f"[PackerExecutor] ENV: {json.dumps(env, indent=2)}")
-            logger.info(f"[PackerExecutor] CMD: {' '.join(cmd)}")
+            
             result = subprocess.run(
                 cmd,
                 cwd=self.working_dir,
                 capture_output=True,
                 text=True,
                 timeout=60,
-                env=env
+                env=self._get_env()
             )
-            logger.info(f"[PackerExecutor] VALIDATE STDOUT: {result.stdout}")
-            logger.info(f"[PackerExecutor] VALIDATE STDERR: {result.stderr}")
             success = result.returncode == 0
+            
+            if result.stdout:
+                logger.command_output("packer_validate", result.stdout, result.returncode)
+            
             if not success:
-                logger.error(f"[PackerExecutor] VALIDATE FAILED: returncode={result.returncode}")
+                error_msg = self._extract_error_from_packer(result.stderr)
+                logger.error(
+                    f"Packer validation failed: {error_msg}",
+                    category=LogCategory.ERROR,
+                    returncode=result.returncode
+                )
             else:
-                logger.info("[PackerExecutor] VALIDATE SUCCESSFUL")
+                logger.success("Packer template validated", category=LogCategory.STATUS)
+            
+            logger.operation_end("packer_validate", success)
             return success, result.stdout, result.stderr
         except Exception as e:
-            logger.error(f"[PackerExecutor] VALIDATE ERROR: {e}")
+            logger.exception("Packer validation failed with exception", exception=e)
+            logger.operation_end("packer_validate", success=False)
             return False, "", str(e)
 
     def build(self, template_file: str, variables: Optional[Dict[str, Any]] = None, extra_env: Optional[Dict[str, str]] = None, force: bool = True) -> tuple[bool, str]:
@@ -112,46 +130,112 @@ class PackerExecutor:
         Returns:
             tuple: (success, output)
         """
-        logger.info(f"[PackerExecutor] BUILD: template_file={template_file}, working_dir={self.working_dir}, force={force}")
+        logger.operation_start(
+            "packer_build",
+            template=template_file,
+            force=force,
+            var_count=len(variables or {})
+        )
         try:
             cmd = [self.packer_path, "build"]
             if force:
                 cmd.append("-force")
             if variables:
-                logger.info(f"[PackerExecutor] BUILD VARIABLES: {json.dumps(variables, indent=2)}")
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
             cmd.append(template_file)
-            env = self._get_env(extra_env)
-            logger.debug(f"[PackerExecutor] ENV: {json.dumps(env, indent=2)}")
-            logger.info(f"[PackerExecutor] CMD: {' '.join(cmd)}")
+            
+            logger.info(
+                "Starting Packer build process (this may take several minutes)...",
+                category=LogCategory.STATUS
+            )
+            
             process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                env=env
+                env=self._get_env(extra_env)
             )
             output_lines = []
             for line in process.stdout:
                 line = line.rstrip()
                 if line:
-                    logger.info(f"[PackerExecutor] BUILD OUTPUT: {line}")
+                    logger.info(line, category=LogCategory.OUTPUT)
                     output_lines.append(line)
+            
             process.wait(timeout=3600)
-            full_output = "\n".join(output_lines)
             success = process.returncode == 0
+            
             if not success:
-                logger.error(f"[PackerExecutor] BUILD FAILED: returncode={process.returncode}")
-                logger.error(f"[PackerExecutor] BUILD OUTPUT (last 50 lines): {chr(10).join(output_lines[-50:])}")
+                logger.error(
+                    f"Packer build failed",
+                    category=LogCategory.ERROR,
+                    returncode=process.returncode,
+                    output_lines=len(output_lines)
+                )
             else:
-                logger.info("[PackerExecutor] BUILD SUCCESSFUL")
-            return success, full_output
+                logger.success(
+                    "Packer build completed successfully",
+                    category=LogCategory.STATUS,
+                    output_lines=len(output_lines)
+                )
+            
+            logger.operation_end("packer_build", success)
+            return success, "\n".join(output_lines)
         except subprocess.TimeoutExpired:
-            logger.error("[PackerExecutor] BUILD TIMEOUT")
-            return False, "Build timed out after 1 hour"
+            logger.error(
+                "Packer build timed out after 1 hour",
+                category=LogCategory.ERROR
+            )
+            logger.operation_end("packer_build", success=False)
+            return False, "Build timed out"
         except Exception as e:
-            logger.error(f"[PackerExecutor] BUILD ERROR: {e}")
+            logger.exception("Packer build failed with exception", exception=e)
+            logger.operation_end("packer_build", success=False)
             return False, str(e)
+
+    def _extract_error_from_packer(self, stderr: str) -> str:
+        """Extract meaningful error message from Packer stderr"""
+        import re
+        
+        # Look for actual error messages (lines with * Get or error patterns)
+        lines = stderr.split('\n')
+        errors = []
+        for line in lines:
+            # Skip verbose TRACE/DEBUG lines
+            if '[TRACE]' in line or '[DEBUG]' in line or 'plugingetter' in line:
+                continue
+            # Look for actual errors
+            if '* Get' in line or 'Error' in line or 'error' in line or line.strip().startswith('*'):
+                errors.append(line.strip())
+        
+        if errors:
+            return " | ".join(errors[:3])  # First 3 errors
+        
+        # Fallback: return last non-empty line
+        for line in reversed(lines):
+            if line.strip() and '[TRACE]' not in line and '[DEBUG]' not in line:
+                return line.strip()
+        
+        return "Unknown error"
+        errors = []
+        for line in lines:
+            # Skip verbose TRACE/DEBUG lines
+            if '[TRACE]' in line or '[DEBUG]' in line or 'plugingetter' in line:
+                continue
+            # Look for actual errors
+            if '* Get' in line or 'Error' in line or 'error' in line or line.strip().startswith('*'):
+                errors.append(line.strip())
+        
+        if errors:
+            return " | ".join(errors)
+        
+        # Fallback: return last non-empty line
+        for line in reversed(lines):
+            if line.strip() and '[TRACE]' not in line and '[DEBUG]' not in line:
+                return line.strip()
+        
+        return "Unknown error"
