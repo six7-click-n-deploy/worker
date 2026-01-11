@@ -43,7 +43,7 @@ class Failure(Exception):
         return json.loads(str(self))
 
 @celery_app.task(bind=True, name="tasks.deploy_application")
-def deploy_application(self, deployment_id: str, app_git_link: str, release: str, user_vars: Dict[str, Any]):
+def deploy_application(self, deployment_id: str, app_git_link: str, release: str, user_vars: Dict[str, Any], teams: Dict[str, list] = None):
     """
     Deploy an application using Terraform and Packer
     
@@ -52,6 +52,7 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
         app_git_link: Git repo URL
         release: Tag/Release to checkout
         user_vars: User variables for Packer/Terraform
+        teams: Teams mit User-Emails {"team_name": [{"email": "user@example.com"}]}
         
     Returns:
         dict: status, logs, tf_state, commit_info, terraform_outputs
@@ -62,6 +63,10 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
     outputs = None
     commit_info = None
     terraform_dir = None
+    
+    # Default teams to empty dict if not provided
+    if teams is None:
+        teams = {}
 
     def collect_terraform_state():
         """Try to collect terraform state even on failure"""
@@ -182,7 +187,12 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
                     "Building Docker image (this may take several minutes)...",
                     category=LogCategory.STATUS
                 )
-                success, output = packer.build("template.pkr.hcl", {})
+                # Merge user_vars with teams for Packer
+                packer_vars = {**user_vars}
+                if teams:
+                    packer_vars["users"] = teams
+                
+                success, output = packer.build("template.pkr.hcl", packer_vars)
                 if not success:
                     raise Exception(f"Packer build failed: {output}")
                 
@@ -214,7 +224,12 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
             task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
             
             task_logger.info("Planning Terraform deployment...", category=LogCategory.OPERATION)
-            success, stdout, stderr = terraform.plan(variables=user_vars)
+            # Merge user_vars with teams for Terraform
+            terraform_vars = {**user_vars}
+            if teams:
+                terraform_vars["users"] = teams
+            
+            success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
                 raise Exception("Terraform plan failed")
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
@@ -223,7 +238,7 @@ def deploy_application(self, deployment_id: str, app_git_link: str, release: str
                 "Applying Terraform configuration (this may take several minutes)...",
                 category=LogCategory.STATUS
             )
-            success, stdout, stderr = terraform.apply(variables=user_vars)
+            success, stdout, stderr = terraform.apply(variables=terraform_vars)
             if not success:
                 raise Exception("Terraform apply failed")
             task_logger.success("Terraform resources created", category=LogCategory.STATUS)
