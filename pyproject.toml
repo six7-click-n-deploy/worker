@@ -3,6 +3,7 @@ name = "worker"
 version = "0.1.0"
 description = "Celery Worker für Click-n-Deploy"
 license = "Apache-2.0"
+package-mode = false
 authors = [
     "Dein Name <dein@email.de>"
 ]
