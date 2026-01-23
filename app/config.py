@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # OpenStack configuration
     OPENSTACK_CLOUDS_YAML: str = "/app/clouds.yaml"
     
+    # Git
+    GIT_ACCESS_TOKEN: str = ""
+    
     class Config:
         env_file = ".env"
         case_sensitive = True
