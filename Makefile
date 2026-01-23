@@ -56,3 +56,4 @@ docker-build: ## Build Docker image
 
 docker-run: ## Run Docker container
 	docker run --rm -it worker:dev
+
