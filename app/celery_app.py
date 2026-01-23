@@ -1,11 +1,8 @@
-from .config import settings
 from celery import Celery
 
-celery_app = Celery(
-    "worker",
-    broker=settings.CELERY_BROKER_URL,
-    include=["app.tasks"]
-)
+from .config import settings
+
+celery_app = Celery("worker", broker=settings.CELERY_BROKER_URL, include=["app.tasks"])
 
 celery_app.conf.update(
     task_serializer="json",

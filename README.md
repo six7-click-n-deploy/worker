@@ -127,7 +127,7 @@ make docker-build      # Build Docker image
   - `deploy_application`: Full deployment with Packer + Terraform
   - `delete_deployment`: Infrastructure teardown
   - `upgrade_deployment`: Update to new version
-  
+
 - **Git Service** (`services/git_service.py`): Handles repository cloning and cleanup
 - **Executors** (`services/executors.py`): Wrappers for Terraform and Packer CLI tools with OpenStack env injection
 - **OpenStack Auth** (`services/openstack_auth.py`): Manages OpenStack credentials from YAML files
@@ -297,7 +297,7 @@ source "openstack" "image" {
 
 build {
   sources = ["source.openstack.image"]
-  
+
   provisioner "shell" {
     inline = [
       "sudo apt-get update",
