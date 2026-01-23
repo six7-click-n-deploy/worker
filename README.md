@@ -11,6 +11,114 @@ Python worker service that processes deployment tasks using Celery for OpenStack
 - **Automatic Cleanup**: Clones repositories fresh for each task and cleans up afterwards
 - **Database Integration**: Updates deployment status in PostgreSQL database
 
+## Development
+
+### Prerequisites
+
+- Python 3.10 or 3.11
+- Poetry (dependency management)
+- Docker (optional, for container testing)
+
+### Setup
+
+```bash
+# Install dependencies
+poetry install --with dev
+
+# Or using make
+make install
+```
+
+### Code Quality Tools
+
+#### Linting & Formatting
+
+```bash
+# Run all linters
+make lint
+
+# Auto-format code
+make format
+
+# Individual tools
+poetry run ruff check .              # Fast linting
+poetry run black .                   # Code formatting
+poetry run isort .                   # Import sorting
+poetry run mypy app/                 # Type checking
+```
+
+#### Testing
+
+```bash
+# Run all tests
+make test
+
+# Run only unit tests
+make test-unit
+
+# Run with coverage
+make test-cov
+
+# Run in watch mode (continuous)
+make test-watch
+```
+
+#### Pre-commit Hooks
+
+```bash
+# Install pre-commit hooks
+pip install pre-commit
+pre-commit install
+
+# Run manually
+pre-commit run --all-files
+```
+
+### CI/CD Pipeline
+
+The worker uses GitHub Actions for automated testing and Docker image building:
+
+**Pipeline Stages:**
+
+1. **Lint & Format Check** (parallel)
+   - Ruff linting
+   - Black formatting check
+   - isort import sorting check
+   - MyPy type checking
+
+2. **Tests** (runs after lint passes)
+   - Unit tests with pytest
+   - Coverage reporting to Codecov
+   - Tests on Python 3.10 and 3.11
+
+3. **Build Docker Image** (runs after tests pass)
+   - Builds Docker image
+   - Saves as artifact
+   - **Does NOT push on PR**
+
+4. **Push Docker Image** (only on merge to main)
+   - Loads built image
+   - Pushes to GitHub Container Registry
+   - Tags: `latest`, `main`, `sha-<commit>`
+
+**Workflow File:** `.github/workflows/worker-ci.yml`
+
+### Available Make Commands
+
+```bash
+make help              # Show all available commands
+make install           # Install dependencies
+make lint              # Run all linters
+make format            # Auto-format code
+make test              # Run all tests
+make test-unit         # Run only unit tests
+make test-integration  # Run only integration tests
+make test-cov          # Run tests with coverage
+make clean             # Clean up generated files
+make check             # Run linters + tests (CI simulation)
+make docker-build      # Build Docker image
+```
+
 ## Architecture
 
 ### Components
@@ -19,7 +127,7 @@ Python worker service that processes deployment tasks using Celery for OpenStack
   - `deploy_application`: Full deployment with Packer + Terraform
   - `delete_deployment`: Infrastructure teardown
   - `upgrade_deployment`: Update to new version
-  
+
 - **Git Service** (`services/git_service.py`): Handles repository cloning and cleanup
 - **Executors** (`services/executors.py`): Wrappers for Terraform and Packer CLI tools with OpenStack env injection
 - **OpenStack Auth** (`services/openstack_auth.py`): Manages OpenStack credentials from YAML files
@@ -189,7 +297,7 @@ source "openstack" "image" {
 
 build {
   sources = ["source.openstack.image"]
-  
+
   provisioner "shell" {
     inline = [
       "sudo apt-get update",

@@ -1,10 +1,13 @@
 """
 OpenStack authentication service for setting up credentials
 """
-import os
-import yaml
+
 import logging
-from typing import Dict, Any, Optional
+import os
+from typing import Any
+
+import yaml
+
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -16,7 +19,7 @@ class OpenStackAuthService:
     def __init__(self):
         self.clouds_yaml_path = settings.OPENSTACK_CLOUDS_YAML
 
-    def load_clouds_yaml(self) -> Optional[Dict[str, Any]]:
+    def load_clouds_yaml(self) -> dict[str, Any] | None:
         """
         Load OpenStack clouds.yaml configuration
 
@@ -25,7 +28,7 @@ class OpenStackAuthService:
         """
         try:
             if os.path.exists(self.clouds_yaml_path):
-                with open(self.clouds_yaml_path, 'r') as f:
+                with open(self.clouds_yaml_path) as f:
                     clouds_config = yaml.safe_load(f)
                     logger.info(f"Loaded clouds.yaml from {self.clouds_yaml_path}")
                     return clouds_config
@@ -36,7 +39,7 @@ class OpenStackAuthService:
             logger.error(f"Failed to load clouds.yaml: {e}")
             return None
 
-    def get_environment_variables(self, cloud_name: str = "openstack") -> Dict[str, str]:
+    def get_environment_variables(self, cloud_name: str = "openstack") -> dict[str, str]:
         """
         Get OpenStack environment variables from clouds.yaml
 
@@ -47,28 +50,28 @@ class OpenStackAuthService:
             dict: Environment variables for OpenStack authentication
         """
         clouds_config = self.load_clouds_yaml()
-        if not clouds_config or cloud_name not in clouds_config.get('clouds', {}):
+        if not clouds_config or cloud_name not in clouds_config.get("clouds", {}):
             logger.warning(f"Cloud '{cloud_name}' not found in clouds.yaml")
             return {}
 
-        cloud_config = clouds_config['clouds'][cloud_name]
-        auth_config = cloud_config.get('auth', {})
+        cloud_config = clouds_config["clouds"][cloud_name]
+        auth_config = cloud_config.get("auth", {})
 
         # Map clouds.yaml auth fields to OpenStack environment variables
         env_vars = {}
 
         # Standard OpenStack environment variables
-        env_vars['OS_AUTH_URL'] = auth_config.get('auth_url', '')
-        env_vars['OS_PROJECT_ID'] = auth_config.get('project_id', '')
-        env_vars['OS_PROJECT_NAME'] = auth_config.get('project_name', '')
-        env_vars['OS_USER_DOMAIN_NAME'] = auth_config.get('user_domain_name', 'Default')
-        env_vars['OS_USERNAME'] = auth_config.get('username', '')
-        env_vars['OS_PASSWORD'] = auth_config.get('password', '')
-        env_vars['OS_REGION_NAME'] = auth_config.get('region_name', '')
+        env_vars["OS_AUTH_URL"] = auth_config.get("auth_url", "")
+        env_vars["OS_PROJECT_ID"] = auth_config.get("project_id", "")
+        env_vars["OS_PROJECT_NAME"] = auth_config.get("project_name", "")
+        env_vars["OS_USER_DOMAIN_NAME"] = auth_config.get("user_domain_name", "Default")
+        env_vars["OS_USERNAME"] = auth_config.get("username", "")
+        env_vars["OS_PASSWORD"] = auth_config.get("password", "")
+        env_vars["OS_REGION_NAME"] = auth_config.get("region_name", "")
 
         # Additional cloud-specific settings
-        if 'region_name' in cloud_config:
-            env_vars['OS_REGION_NAME'] = cloud_config['region_name']
+        if "region_name" in cloud_config:
+            env_vars["OS_REGION_NAME"] = cloud_config["region_name"]
 
         # Filter out empty values
         env_vars = {k: v for k, v in env_vars.items() if v}
