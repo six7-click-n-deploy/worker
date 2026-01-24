@@ -44,7 +44,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     curl \
     ca-certificates \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# OpenStack CLI installieren
+RUN pip install --no-cache-dir python-openstackclient
 
 # Terraform installieren (platform-aware)
 RUN ARCH="${TARGETARCH:-amd64}" && \
