@@ -101,7 +101,15 @@ def deploy_application(
 
     try:
         task_logger.phase("Starting Deployment")
-        task_logger.resource_info("deployment", deployment_id, release=release, git_url=app_git_link)
+        task_logger.resource_info(
+            "deployment",
+            deployment_id,
+            app_id=app_id,
+            git_url=app_git_link,
+            release=release,
+            user_vars_keys=list(user_vars.keys()),
+            teams_keys=list(teams.keys()),
+        )
 
         # Phase 1: OpenStack credentials
         task_logger.phase("OpenStack Setup")
@@ -181,17 +189,18 @@ def deploy_application(
                     if not success:
                         raise Exception("Packer init failed")
 
+                    # Merge user_vars with teams for Packer
+                    packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
+                    packer_vars["image_name"] = image_name
+
                     task_logger.info("Validating Packer template...", category=LogCategory.OPERATION)
-                    success, stdout, stderr = packer.validate("template.pkr.hcl", {})
+                    success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
                     if not success:
                         raise Exception(f"Packer validation failed: {stderr}")
 
                     task_logger.info(
                         "Building Docker image (this may take several minutes)...", category=LogCategory.STATUS
                     )
-                    # Merge user_vars with teams for Packer
-                    packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
-                    packer_vars["image_name"] = image_name
 
                     success, output = packer.build("template.pkr.hcl", packer_vars)
                     if not success:

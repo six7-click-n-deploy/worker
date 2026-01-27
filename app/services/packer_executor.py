@@ -78,13 +78,16 @@ class PackerExecutor:
             tuple: (success, stdout, stderr)
         """
         logger.operation_start("packer_validate", template=template_file)
+        logger.info(f"Packer working directory: {self.working_dir}", category=LogCategory.SYSTEM)
+        logger.info(f"Files in working directory: {os.listdir(self.working_dir)}", category=LogCategory.SYSTEM)
         try:
             cmd = [self.packer_path, "validate"]
+
             if variables:
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(template_file)
+            cmd.append(template_file)  # Use absolute path
 
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
@@ -131,11 +134,12 @@ class PackerExecutor:
             cmd = [self.packer_path, "build"]
             if force:
                 cmd.append("-force")
+
             if variables:
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(template_file)
+            cmd.append(template_file)  # Use absolute path
 
             logger.info("Starting Packer build process (this may take several minutes)...", category=LogCategory.STATUS)
 
@@ -196,24 +200,6 @@ class PackerExecutor:
 
         if errors:
             return " | ".join(errors[:3])  # First 3 errors
-
-        # Fallback: return last non-empty line
-        for line in reversed(lines):
-            if line.strip() and "[TRACE]" not in line and "[DEBUG]" not in line:
-                return line.strip()
-
-        return "Unknown error"
-        errors = []
-        for line in lines:
-            # Skip verbose TRACE/DEBUG lines
-            if "[TRACE]" in line or "[DEBUG]" in line or "plugingetter" in line:
-                continue
-            # Look for actual errors
-            if "* Get" in line or "Error" in line or "error" in line or line.strip().startswith("*"):
-                errors.append(line.strip())
-
-        if errors:
-            return " | ".join(errors)
 
         # Fallback: return last non-empty line
         for line in reversed(lines):
