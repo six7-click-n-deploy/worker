@@ -91,7 +91,7 @@ class PackerExecutor:
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
 
-            cmd.append(".")  # Use absolute path
+            cmd.append(".")
 
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
