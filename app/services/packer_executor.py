@@ -28,6 +28,9 @@ class PackerExecutor:
         if extra_env:
             env.update(extra_env)
         env["PACKER_LOG"] = "1"
+        # Ensure clouds.yaml is found by Packer/OpenStack
+        if "OS_CLIENT_CONFIG_FILE" not in env:
+            env["OS_CLIENT_CONFIG_FILE"] = settings.OPENSTACK_CLOUDS_YAML
         return env
 
     def init(self) -> tuple[bool, str, str]:
@@ -87,7 +90,8 @@ class PackerExecutor:
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(template_file)  # Use absolute path
+
+            cmd.append(".")  # Use absolute path
 
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
