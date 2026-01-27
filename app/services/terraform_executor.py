@@ -27,7 +27,10 @@ class TerraformExecutor:
         env.update(self.env_vars)
         if extra_env:
             env.update(extra_env)
-        env["TF_LOG"] = "INFO"  # Changed from DEBUG for cleaner logs
+        env["TF_LOG"] = "DEBUG"
+        # Ensure clouds.yaml is found by Terraform/OpenStack
+        if "OS_CLIENT_CONFIG_FILE" not in env:
+            env["OS_CLIENT_CONFIG_FILE"] = settings.OPENSTACK_CLOUDS_YAML
         return env
 
     def init(self) -> tuple[bool, str, str]:
@@ -37,11 +40,15 @@ class TerraformExecutor:
             tuple: (success, stdout, stderr)
         """
         logger.operation_start("terraform_init", working_dir=self.working_dir)
+        logger.debug(f"[TF] Init: working_dir={self.working_dir}, terraform_path={self.terraform_path}")
         try:
             cmd = [self.terraform_path, "init", "-input=false"]
+            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
             )
+            logger.debug(f"[TF] Init stdout: {result.stdout}")
+            logger.debug(f"[TF] Init stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
@@ -80,6 +87,7 @@ class TerraformExecutor:
         logger.operation_start("terraform_plan", var_file=var_file, var_count=len(variables or {}))
         try:
             cmd = [self.terraform_path, "plan", "-input=false"]
+            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -88,16 +96,24 @@ class TerraformExecutor:
 
             logger.info("Analyzing Terraform configuration...", category=LogCategory.STATUS)
 
+            print(variables)
+
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
             )
+            logger.debug(f"[TF] Plan stdout: {result.stdout}")
+            logger.debug(f"[TF] Plan stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
                 logger.command_output("terraform_plan", result.stdout, result.returncode)
 
             if not success:
-                logger.error("Terraform plan failed", category=LogCategory.ERROR, returncode=result.returncode)
+                logger.error(
+                    f"Terraform plan failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
+                    category=LogCategory.ERROR,
+                    returncode=result.returncode,
+                )
             else:
                 logger.success("Terraform plan completed", category=LogCategory.STATUS)
 
@@ -120,6 +136,7 @@ class TerraformExecutor:
         logger.operation_start("terraform_apply", var_file=var_file, var_count=len(variables or {}))
         try:
             cmd = [self.terraform_path, "apply", "-auto-approve", "-input=false"]
+            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -131,13 +148,20 @@ class TerraformExecutor:
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=1800, env=self._get_env()
             )
+            logger.debug(f"[TF] Apply finished: command={' '.join(cmd)}, returncode={result.returncode}")
+            logger.debug(f"[TF] Apply stdout: {result.stdout}")
+            logger.debug(f"[TF] Apply stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
                 logger.command_output("terraform_apply", result.stdout, result.returncode)
 
             if not success:
-                logger.error("Terraform apply failed", category=LogCategory.ERROR, returncode=result.returncode)
+                logger.error(
+                    f"Terraform apply failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
+                    category=LogCategory.ERROR,
+                    returncode=result.returncode,
+                )
             else:
                 logger.success("Terraform apply completed successfully", category=LogCategory.STATUS)
 
@@ -164,6 +188,7 @@ class TerraformExecutor:
         logger.operation_start("terraform_destroy", var_file=var_file, var_count=len(variables or {}))
         try:
             cmd = [self.terraform_path, "destroy", "-auto-approve", "-input=false"]
+            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -175,6 +200,8 @@ class TerraformExecutor:
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=1800, env=self._get_env()
             )
+            logger.debug(f"[TF] Destroy stdout: {result.stdout}")
+            logger.debug(f"[TF] Destroy stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
@@ -205,9 +232,12 @@ class TerraformExecutor:
         logger.operation_start("terraform_output")
         try:
             cmd = [self.terraform_path, "output", "-json"]
+            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
             )
+            logger.debug(f"[TF] Output stdout: {result.stdout}")
+            logger.debug(f"[TF] Output stderr: {result.stderr}")
             if result.returncode != 0:
                 logger.warning(
                     "Terraform output retrieval failed", category=LogCategory.WARNING, returncode=result.returncode

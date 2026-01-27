@@ -28,6 +28,9 @@ class PackerExecutor:
         if extra_env:
             env.update(extra_env)
         env["PACKER_LOG"] = "1"
+        # Ensure clouds.yaml is found by Packer/OpenStack
+        if "OS_CLIENT_CONFIG_FILE" not in env:
+            env["OS_CLIENT_CONFIG_FILE"] = settings.OPENSTACK_CLOUDS_YAML
         return env
 
     def init(self) -> tuple[bool, str, str]:
@@ -37,11 +40,15 @@ class PackerExecutor:
             tuple: (success, stdout, stderr)
         """
         logger.operation_start("packer_init", working_dir=self.working_dir)
+        logger.debug(f"[Packer] Init: working_dir={self.working_dir}, packer_path={self.packer_path}")
         try:
             cmd = [self.packer_path, "init", "."]
+            logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
             )
+            logger.debug(f"[Packer] Init stdout: {result.stdout}")
+            logger.debug(f"[Packer] Init stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
@@ -78,17 +85,24 @@ class PackerExecutor:
             tuple: (success, stdout, stderr)
         """
         logger.operation_start("packer_validate", template=template_file)
+        logger.info(f"Packer working directory: {self.working_dir}", category=LogCategory.SYSTEM)
+        logger.info(f"Files in working directory: {os.listdir(self.working_dir)}", category=LogCategory.SYSTEM)
         try:
             cmd = [self.packer_path, "validate"]
+            logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
+
             if variables:
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(template_file)
+
+            cmd.append(".")
 
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
             )
+            logger.debug(f"[Packer] Validate stdout: {result.stdout}")
+            logger.debug(f"[Packer] Validate stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
@@ -131,14 +145,16 @@ class PackerExecutor:
             cmd = [self.packer_path, "build"]
             if force:
                 cmd.append("-force")
+
             if variables:
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(template_file)
+            cmd.append(".")
 
             logger.info("Starting Packer build process (this may take several minutes)...", category=LogCategory.STATUS)
 
+            logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
             process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
@@ -151,6 +167,7 @@ class PackerExecutor:
             for line in process.stdout:
                 line = line.rstrip()
                 if line:
+                    logger.debug(f"[Packer] Build output: {line}")
                     logger.info(line, category=LogCategory.OUTPUT)
                     output_lines.append(line)
 
@@ -196,24 +213,6 @@ class PackerExecutor:
 
         if errors:
             return " | ".join(errors[:3])  # First 3 errors
-
-        # Fallback: return last non-empty line
-        for line in reversed(lines):
-            if line.strip() and "[TRACE]" not in line and "[DEBUG]" not in line:
-                return line.strip()
-
-        return "Unknown error"
-        errors = []
-        for line in lines:
-            # Skip verbose TRACE/DEBUG lines
-            if "[TRACE]" in line or "[DEBUG]" in line or "plugingetter" in line:
-                continue
-            # Look for actual errors
-            if "* Get" in line or "Error" in line or "error" in line or line.strip().startswith("*"):
-                errors.append(line.strip())
-
-        if errors:
-            return " | ".join(errors)
 
         # Fallback: return last non-empty line
         for line in reversed(lines):
