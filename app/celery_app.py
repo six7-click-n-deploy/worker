@@ -6,7 +6,7 @@ celery_app = Celery("worker", broker=settings.CELERY_BROKER_URL, include=["app.t
 
 celery_app.conf.update(
     broker_url=settings.CELERY_BROKER_URL,
-    result_backend="rpc://",  # Wichtig: Result Backend hinzufügen!
+    result_backend=settings.CELERY_RESULT_BACKEND,  # Wichtig: Result Backend hinzufügen!
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
