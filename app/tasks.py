@@ -43,6 +43,20 @@ class Failure(Exception):
         return json.loads(str(self))
 
 
+# --- Hilfsfunktion für Variablen-Umwandlung ---
+def convert_lists_to_string(obj):
+    """
+    Rekursive Hilfsfunktion, die alle Listen in einem dict in kommaseparierte Strings umwandelt.
+    Wird für Packer- und Terraform-Variablen genutzt.
+    """
+    if isinstance(obj, dict):
+        return {k: convert_lists_to_string(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return ",".join(map(str, obj))
+    else:
+        return obj
+
+
 @celery_app.task(bind=True, name="tasks.deploy_application")
 def deploy_application(
     self,
@@ -189,9 +203,15 @@ def deploy_application(
                     if not success:
                         raise Exception("Packer init failed")
 
+                    print("Packer Variables:")
+                    print(user_vars)
+
                     # Merge user_vars with teams for Packer
+
                     packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
                     packer_vars["image_name"] = image_name
+                    packer_vars = convert_lists_to_string(packer_vars)
+                    print(packer_vars)
 
                     task_logger.info("Validating Packer template...", category=LogCategory.OPERATION)
                     success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
@@ -229,10 +249,12 @@ def deploy_application(
 
             task_logger.info("Planning Terraform deployment...", category=LogCategory.OPERATION)
             # Merge user_vars with teams for Terraform
+
             terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
             terraform_vars["image_name"] = image_name
             if teams:
                 terraform_vars["users"] = teams
+            terraform_vars = convert_lists_to_string(terraform_vars)
 
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
