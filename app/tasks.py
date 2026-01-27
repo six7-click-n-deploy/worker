@@ -44,15 +44,17 @@ class Failure(Exception):
 
 
 # --- Hilfsfunktion für Variablen-Umwandlung ---
-def convert_lists_to_string(obj):
+def clean_backslashes(obj):
     """
-    Rekursive Hilfsfunktion, die alle Listen in einem dict in kommaseparierte Strings umwandelt.
-    Wird für Packer- und Terraform-Variablen genutzt.
+    Rekursive Hilfsfunktion, die Backslashes aus Strings entfernt,
+    aber den Typ (list, dict, str, int, ...) immer beibehält.
     """
     if isinstance(obj, dict):
-        return {k: convert_lists_to_string(v) for k, v in obj.items()}
+        return {k: clean_backslashes(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return ",".join(map(str, obj))
+        return [clean_backslashes(v) for v in obj]
+    elif isinstance(obj, str):
+        return obj.replace("\\", "")
     else:
         return obj
 
@@ -210,7 +212,7 @@ def deploy_application(
 
                     packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
                     packer_vars["image_name"] = image_name
-                    packer_vars = convert_lists_to_string(packer_vars)
+                    packer_vars = clean_backslashes(packer_vars)
                     print(packer_vars)
 
                     task_logger.info("Validating Packer template...", category=LogCategory.OPERATION)
@@ -254,7 +256,7 @@ def deploy_application(
             terraform_vars["image_name"] = image_name
             if teams:
                 terraform_vars["users"] = teams
-            terraform_vars = convert_lists_to_string(terraform_vars)
+            terraform_vars = clean_backslashes(terraform_vars)
 
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
