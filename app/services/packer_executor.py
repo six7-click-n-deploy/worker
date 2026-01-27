@@ -143,7 +143,7 @@ class PackerExecutor:
                 for key, value in variables.items():
                     value_str = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
                     cmd.extend(["-var", f"{key}={value_str}"])
-            cmd.append(template_file)  # Use absolute path
+            cmd.append(".")
 
             logger.info("Starting Packer build process (this may take several minutes)...", category=LogCategory.STATUS)
 
