@@ -43,20 +43,22 @@ class Failure(Exception):
         return json.loads(str(self))
 
 
-# --- Hilfsfunktion für Variablen-Umwandlung ---
-def clean_backslashes(obj):
+# --- Hilfsfunktion: user_vars auf erster Ebene in Strings umwandeln, Backslashes entfernen ---
+def flatten_vars_to_strings(d):
     """
-    Rekursive Hilfsfunktion, die Backslashes aus Strings entfernt,
-    aber den Typ (list, dict, str, int, ...) immer beibehält.
+    Wandelt alle Werte auf der ersten Ebene eines dict in Strings um (außer None),
+    Listen werden zu kommaseparierten Strings, entfernt Backslashes.
     """
-    if isinstance(obj, dict):
-        return {k: clean_backslashes(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [clean_backslashes(v) for v in obj]
-    elif isinstance(obj, str):
-        return obj.replace("\\", "")
-    else:
-        return obj
+    result = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, list):
+            s = ",".join(str(x) for x in v if x is not None)
+            result[k] = s.replace("\\", "")
+        else:
+            result[k] = str(v).replace("\\", "")
+    return result
 
 
 @celery_app.task(bind=True, name="tasks.deploy_application")
@@ -209,11 +211,9 @@ def deploy_application(
                     print(user_vars)
 
                     # Merge user_vars with teams for Packer
-
                     packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
                     packer_vars["image_name"] = image_name
-                    packer_vars = clean_backslashes(packer_vars)
-                    print(packer_vars)
+                    packer_vars = flatten_vars_to_strings(packer_vars)
 
                     task_logger.info("Validating Packer template...", category=LogCategory.OPERATION)
                     success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
@@ -250,16 +250,22 @@ def deploy_application(
             task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
             task_logger.info("Planning Terraform deployment...", category=LogCategory.OPERATION)
-            # Merge user_vars with teams for Terraform
 
+            # Merge user_vars with teams for Terraform
             terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
             terraform_vars["image_name"] = image_name
             if teams:
                 terraform_vars["users"] = teams
-            terraform_vars = clean_backslashes(terraform_vars)
+            # Serialisiere dicts/lists für Terraform korrekt als JSON-String (z.B. users)
+            for k, v in list(terraform_vars.items()):
+                if isinstance(v, (dict, list)):
+                    terraform_vars[k] = json.dumps(v)
+            terraform_vars = flatten_vars_to_strings(terraform_vars)
 
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
+                print(stderr)
+                print(stdout)
                 raise Exception("Terraform plan failed")
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
@@ -293,8 +299,9 @@ def deploy_application(
         summary = task_logger.get_summary()
         task_logger.info("Deployment summary", category=LogCategory.SYSTEM, **summary)
 
-        # Return result (sent via task-succeeded event)
-        return {
+        task_logger.info("Terraform deployment output", category=LogCategory.SYSTEM, **outputs)
+
+        result = {
             "status": "success",
             "deployment_id": deployment_id,
             "logs": task_logger.get_logs_dict(),
@@ -302,6 +309,11 @@ def deploy_application(
             "commit_info": commit_info,
             "terraform_outputs": outputs,
         }
+
+        print(result)
+
+        # Return result (sent via task-succeeded event)
+        return result
 
     except Exception as e:
         task_logger.exception(f"Deployment failed: {str(e)}", exception=e, deployment_id=deployment_id)

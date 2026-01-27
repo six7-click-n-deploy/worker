@@ -40,11 +40,15 @@ class PackerExecutor:
             tuple: (success, stdout, stderr)
         """
         logger.operation_start("packer_init", working_dir=self.working_dir)
+        logger.debug(f"[Packer] Init: working_dir={self.working_dir}, packer_path={self.packer_path}")
         try:
             cmd = [self.packer_path, "init", "."]
+            logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
             )
+            logger.debug(f"[Packer] Init stdout: {result.stdout}")
+            logger.debug(f"[Packer] Init stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
@@ -85,6 +89,7 @@ class PackerExecutor:
         logger.info(f"Files in working directory: {os.listdir(self.working_dir)}", category=LogCategory.SYSTEM)
         try:
             cmd = [self.packer_path, "validate"]
+            logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
 
             if variables:
                 for key, value in variables.items():
@@ -96,6 +101,8 @@ class PackerExecutor:
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
             )
+            logger.debug(f"[Packer] Validate stdout: {result.stdout}")
+            logger.debug(f"[Packer] Validate stderr: {result.stderr}")
             success = result.returncode == 0
 
             if result.stdout:
@@ -147,6 +154,7 @@ class PackerExecutor:
 
             logger.info("Starting Packer build process (this may take several minutes)...", category=LogCategory.STATUS)
 
+            logger.debug(f"[Packer] Running command: {' '.join(cmd)}")
             process = subprocess.Popen(
                 cmd,
                 cwd=self.working_dir,
@@ -159,6 +167,7 @@ class PackerExecutor:
             for line in process.stdout:
                 line = line.rstrip()
                 if line:
+                    logger.debug(f"[Packer] Build output: {line}")
                     logger.info(line, category=LogCategory.OUTPUT)
                     output_lines.append(line)
 
