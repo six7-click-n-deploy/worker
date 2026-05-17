@@ -1,12 +1,29 @@
 import json
 import os
+import signal
 from typing import Any
+
+from celery.signals import task_revoked
 
 from .celery_app import celery_app
 from .services import OpenStackService, PackerExecutor, TerraformExecutor, git_service, openstack_auth_service
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
+
+# Per-task registry: celery task id → active TerraformExecutor
+# Used by the revoke handler to kill the running subprocess.
+_active_terraform: dict[str, "TerraformExecutor"] = {}
+
+
+@task_revoked.connect
+def on_task_revoked(request, terminated, signum, expired, **kwargs):
+    """Kill the Terraform subprocess when the Celery task is revoked."""
+    task_id = request.id if hasattr(request, "id") else str(request)
+    executor = _active_terraform.pop(task_id, None)
+    if executor:
+        logger.warning(f"[revoke] Terminating Terraform for task {task_id}")
+        executor.terminate()
 
 
 class Failure(Exception):
@@ -43,12 +60,8 @@ class Failure(Exception):
         return json.loads(str(self))
 
 
-# --- Hilfsfunktion: user_vars auf erster Ebene in Strings umwandeln, Backslashes entfernen ---
 def flatten_vars_to_strings(d):
-    """
-    Wandelt alle Werte auf der ersten Ebene eines dict in Strings um (außer None),
-    Listen werden zu kommaseparierten Strings, entfernt Backslashes.
-    """
+    """Convert all top-level dict values to strings, lists become comma-separated, backslashes removed."""
     result = {}
     for k, v in d.items():
         if v is None:
@@ -72,14 +85,14 @@ def deploy_application(
     teams: dict[str, list] = None,
 ):
     """
-    Deploy an application using Terraform and Packer
+    Deploy an application using Terraform and Packer.
 
     Args:
         deployment_id: UUID of the deployment
         app_git_link: Git repo URL
         release: Tag/Release to checkout
         user_vars: User variables for Packer/Terraform
-        teams: Teams mit User-Emails {"team_name": [{"email": "user@example.com"}]}
+        teams: Teams with user emails {"team_name": [{"email": "user@example.com"}]}
 
     Returns:
         dict: status, logs, tf_state, commit_info, terraform_outputs
@@ -207,9 +220,6 @@ def deploy_application(
                     if not success:
                         raise Exception("Packer init failed")
 
-                    print("Packer Variables:")
-                    print(user_vars)
-
                     # Merge user_vars with teams for Packer
                     packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
                     packer_vars["image_name"] = image_name
@@ -242,6 +252,7 @@ def deploy_application(
 
         try:
             terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
+            _active_terraform[self.request.id] = terraform
 
             task_logger.info("Initializing Terraform...", category=LogCategory.OPERATION)
             success, stdout, stderr = terraform.init()
@@ -256,7 +267,7 @@ def deploy_application(
             terraform_vars["image_name"] = image_name
             if teams:
                 terraform_vars["users"] = teams
-            # Serialisiere dicts/lists für Terraform korrekt als JSON-String (z.B. users)
+            # Serialize dicts/lists for Terraform as JSON strings (e.g. users)
             for k, v in list(terraform_vars.items()):
                 if isinstance(v, (dict, list)):
                     terraform_vars[k] = json.dumps(v)
@@ -264,8 +275,6 @@ def deploy_application(
 
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
-                print(stderr)
-                print(stdout)
                 raise Exception("Terraform plan failed")
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
@@ -291,6 +300,8 @@ def deploy_application(
             tf_state = collect_terraform_state()
             outputs = collect_terraform_outputs()
             raise Exception(f"Terraform error: {str(e)}")
+        finally:
+            _active_terraform.pop(self.request.id, None)
 
         task_logger.phase("Deployment Complete")
         task_logger.success(f"Deployment {deployment_id} completed successfully", category=LogCategory.STATUS)
@@ -310,9 +321,6 @@ def deploy_application(
             "terraform_outputs": outputs,
         }
 
-        print(result)
-
-        # Return result (sent via task-succeeded event)
         return result
 
     except Exception as e:
@@ -339,5 +347,93 @@ def deploy_application(
             try:
                 git_service.cleanup_repository(repo_path)
                 task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
+            except Exception as e:
+                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+
+
+@celery_app.task(bind=True, name="tasks.destroy_application")
+def destroy_application(
+    self,
+    deployment_id: str,
+    app_git_link: str,
+    release: str,
+    user_vars: dict[str, Any],
+    teams: dict[str, list] = None,
+    app_id: str | None = None,
+):
+    """
+    Destroy Terraform resources for a deployment.
+    Clones the repo at the given release, runs terraform destroy.
+    """
+    task_logger = get_logger(f"destroy:{deployment_id}")
+    repo_path = None
+    terraform_dir = None
+
+    if teams is None:
+        teams = {}
+
+    try:
+        task_logger.phase("Starting Destroy")
+
+        # Phase 1: OpenStack credentials
+        openstack_env = openstack_auth_service.get_environment_variables()
+        if not openstack_env or not openstack_env.get("OS_AUTH_URL"):
+            raise Exception("OpenStack credentials not configured")
+
+        # Phase 2: Git clone
+        task_logger.phase("Git Repository Setup")
+        repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
+
+        # Phase 3: Terraform destroy
+        task_logger.phase("Terraform Destroy")
+        terraform_dir = os.path.join(repo_path, "terraform")
+        if not os.path.exists(terraform_dir):
+            raise Exception(f"Terraform directory not found at {terraform_dir}")
+
+        terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
+        _active_terraform[self.request.id] = terraform
+
+        try:
+            task_logger.info("Initializing Terraform...", category=LogCategory.OPERATION)
+            success, _, _ = terraform.init()
+            if not success:
+                raise Exception("Terraform init failed")
+
+            image_name = (app_id or deployment_id) + "-" + release
+            terraform_vars = {**user_vars.get("terraform", {})}
+            terraform_vars["image_name"] = image_name
+            if teams:
+                terraform_vars["users"] = json.dumps(teams)
+            terraform_vars = flatten_vars_to_strings(terraform_vars)
+
+            task_logger.info("Running terraform destroy...", category=LogCategory.OPERATION)
+            success, stdout, stderr = terraform.destroy(variables=terraform_vars)
+            if not success:
+                raise Exception(f"Terraform destroy failed:\n{stderr}")
+
+            task_logger.success("Terraform resources destroyed", category=LogCategory.STATUS)
+
+        finally:
+            _active_terraform.pop(self.request.id, None)
+
+        task_logger.phase("Destroy Complete")
+        return {
+            "status": "destroyed",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+        }
+
+    except Exception as e:
+        task_logger.exception(f"Destroy failed: {str(e)}", exception=e, deployment_id=deployment_id)
+        raise Failure(
+            message=str(e),
+            deployment_id=deployment_id,
+            logs_dict=task_logger.get_logs_dict(),
+        )
+
+    finally:
+        if repo_path:
+            try:
+                git_service.cleanup_repository(repo_path)
             except Exception as e:
                 task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
