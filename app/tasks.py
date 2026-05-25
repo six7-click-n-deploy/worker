@@ -360,6 +360,7 @@ def destroy_application(
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
     app_id: str | None = None,
+    tf_state: str | None = None,
 ):
     """
     Destroy Terraform resources for a deployment.
@@ -389,6 +390,13 @@ def destroy_application(
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
+
+        # Restore state from DB so terraform destroy knows what resources to delete
+        if tf_state:
+            with open(os.path.join(terraform_dir, "terraform.tfstate"), "w") as f:
+                f.write(tf_state)
+        else:
+            task_logger.warning("No terraform state available — destroy may affect 0 resources", category=LogCategory.WARNING)
 
         terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
         _active_terraform[self.request.id] = terraform
