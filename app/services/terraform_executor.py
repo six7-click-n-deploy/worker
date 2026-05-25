@@ -4,6 +4,7 @@ Terraform execution utilities with comprehensive structured logging
 
 import json
 import os
+import signal
 import subprocess
 from typing import Any
 
@@ -20,6 +21,7 @@ class TerraformExecutor:
         self.working_dir = working_dir
         self.terraform_path = settings.TERRAFORM_PATH
         self.env_vars = env_vars or {}
+        self.current_process: subprocess.Popen | None = None
 
     def _get_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
         """Get environment variables including OpenStack credentials and Terraform debug logging"""
@@ -33,6 +35,33 @@ class TerraformExecutor:
             env["OS_CLIENT_CONFIG_FILE"] = settings.OPENSTACK_CLOUDS_YAML
         return env
 
+    def terminate(self) -> None:
+        """Kill the currently running Terraform subprocess, if any."""
+        proc = self.current_process
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                proc.terminate()
+
+    def _run(self, cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
+        """Run a command via Popen so we can track and kill the process."""
+        proc = subprocess.Popen(
+            cmd,
+            cwd=self.working_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=self._get_env(),
+            start_new_session=True,
+        )
+        self.current_process = proc
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        finally:
+            self.current_process = None
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
     def init(self) -> tuple[bool, str, str]:
         """
         Initialize Terraform in the working directory
@@ -44,9 +73,7 @@ class TerraformExecutor:
         try:
             cmd = [self.terraform_path, "init", "-input=false"]
             logger.debug(f"[TF] Running command: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
-            )
+            result = self._run(cmd, timeout=300)
             logger.debug(f"[TF] Init stdout: {result.stdout}")
             logger.debug(f"[TF] Init stderr: {result.stderr}")
             success = result.returncode == 0
@@ -98,9 +125,7 @@ class TerraformExecutor:
 
             print(variables)
 
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
-            )
+            result = self._run(cmd, timeout=300)
             logger.debug(f"[TF] Plan stdout: {result.stdout}")
             logger.debug(f"[TF] Plan stderr: {result.stderr}")
             success = result.returncode == 0
@@ -145,9 +170,7 @@ class TerraformExecutor:
 
             logger.info("Applying Terraform configuration (this may take minutes)...", category=LogCategory.STATUS)
 
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=1800, env=self._get_env()
-            )
+            result = self._run(cmd, timeout=1800)
             logger.debug(f"[TF] Apply finished: command={' '.join(cmd)}, returncode={result.returncode}")
             logger.debug(f"[TF] Apply stdout: {result.stdout}")
             logger.debug(f"[TF] Apply stderr: {result.stderr}")
@@ -197,9 +220,7 @@ class TerraformExecutor:
 
             logger.info("Destroying Terraform resources (this may take minutes)...", category=LogCategory.STATUS)
 
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=1800, env=self._get_env()
-            )
+            result = self._run(cmd, timeout=1800)
             logger.debug(f"[TF] Destroy stdout: {result.stdout}")
             logger.debug(f"[TF] Destroy stderr: {result.stderr}")
             success = result.returncode == 0
@@ -233,9 +254,7 @@ class TerraformExecutor:
         try:
             cmd = [self.terraform_path, "output", "-json"]
             logger.debug(f"[TF] Running command: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
-            )
+            result = self._run(cmd, timeout=60)
             logger.debug(f"[TF] Output stdout: {result.stdout}")
             logger.debug(f"[TF] Output stderr: {result.stderr}")
             if result.returncode != 0:
