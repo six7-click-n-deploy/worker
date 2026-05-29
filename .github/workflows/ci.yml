@@ -157,4 +157,4 @@ jobs:
             --repo six7-click-n-deploy/deployment \
             --ref main
         env:
-          GH_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
