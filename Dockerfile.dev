@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+ENV POETRY_VIRTUALENVS_IN_PROJECT=true \
+    POETRY_VIRTUALENVS_CREATE=true
+
 WORKDIR /app
 
 # Install system dependencies
