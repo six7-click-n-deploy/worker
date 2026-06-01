@@ -20,15 +20,16 @@ class TestConfiguration:
         """Test that required settings attributes exist."""
         from app.config import settings
 
-        assert hasattr(settings, "DATABASE_URL")
         assert hasattr(settings, "CELERY_BROKER_URL")
+        assert hasattr(settings, "CELERY_RESULT_BACKEND")
         assert hasattr(settings, "TEMP_REPO_BASE_PATH")
         assert hasattr(settings, "GIT_ACCESS_TOKEN")
+        assert hasattr(settings, "CREDENTIAL_ENCRYPTION_KEY")
 
     @patch.dict(
         os.environ,
         {
-            "DATABASE_URL": "postgresql://test:test@localhost/test",
+            "CREDENTIAL_ENCRYPTION_KEY": "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U=",
             "CELERY_BROKER_URL": "amqp://test@localhost",
             "GIT_ACCESS_TOKEN": "test-token",
         },
@@ -36,13 +37,11 @@ class TestConfiguration:
     )
     def test_settings_from_environment(self):
         """Test loading settings from environment variables."""
-        # Reload settings with new environment
         from importlib import reload
 
         from app import config
 
         reload(config)
 
-        assert "postgresql" in config.settings.DATABASE_URL
         assert "amqp" in config.settings.CELERY_BROKER_URL
         assert config.settings.GIT_ACCESS_TOKEN == "test-token"
