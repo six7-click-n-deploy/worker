@@ -77,6 +77,8 @@ jobs:
 
       - name: Run unit tests
         run: poetry run pytest -m unit -v --cov=app --cov-report=xml --cov-report=term
+        env:
+          CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
 
       - name: Upload coverage
         if: always()
@@ -114,6 +116,7 @@ jobs:
       - name: Run integration tests
         run: poetry run pytest -m integration -v || [ $? -eq 5 ]
         env:
+          CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
           CELERY_BROKER_URL: "amqp://guest:guest@localhost:5672/"
           CELERY_RESULT_BACKEND: "redis://localhost:6379/0"
 
