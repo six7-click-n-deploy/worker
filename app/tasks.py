@@ -3,10 +3,29 @@ import os
 from typing import Any
 
 from .celery_app import celery_app
-from .services import OpenStackService, PackerExecutor, TerraformExecutor, git_service, openstack_auth_service
+from .config import settings
+from .services import (
+    OpenStackService,
+    PackerBuildLock,
+    PackerExecutor,
+    PerTaskCloudsConfig,
+    TerraformExecutor,
+    git_service,
+)
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
+
+
+def _tfstate_schema_name(deployment_id: str) -> str:
+    """Postgres schema name for one deployment's Terraform state.
+
+    UUIDs contain hyphens, which would force every reference to be
+    double-quoted. Replacing hyphens with underscores keeps the schema
+    a plain unquoted identifier and avoids escaping hazards in any
+    backend-config plumbing.
+    """
+    return f"deployment_{deployment_id.replace('-', '_')}"
 
 
 class Failure(Exception):
@@ -70,6 +89,7 @@ def deploy_application(
     release: str,
     user_vars: dict[str, Any],
     teams: dict[str, list] = None,
+    openstack_envelope: dict[str, Any] | None = None,
 ):
     """
     Deploy an application using Terraform and Packer
@@ -80,6 +100,10 @@ def deploy_application(
         release: Tag/Release to checkout
         user_vars: User variables for Packer/Terraform
         teams: Teams mit User-Emails {"team_name": [{"email": "user@example.com"}]}
+        openstack_envelope: Encrypted per-user OpenStack credential envelope
+            shipped from the backend. Required for new deploys; the optional
+            default exists only so older queued messages don't crash the
+            worker on rollout (we raise immediately if it's missing).
 
     Returns:
         dict: status, logs, tf_state, commit_info, terraform_outputs
@@ -90,28 +114,63 @@ def deploy_application(
     outputs = None
     commit_info = None
     terraform_dir = None
+    openstack_env: dict[str, str] = {}
+    clouds_config: PerTaskCloudsConfig | None = None
+
+    # Terraform's pg backend lives in a worker-only Postgres. Configured
+    # at deploy/destroy time by writing a `pg_backend_override.tf` next
+    # to the cloned repo's terraform/ directory. One schema per
+    # deployment isolates state and locks.
+    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
+    tfstate_schema = _tfstate_schema_name(deployment_id)
 
     # Default teams to empty dict if not provided
     if teams is None:
         teams = {}
 
     def collect_terraform_state():
-        """Try to collect terraform state even on failure"""
-        if terraform_dir and os.path.exists(terraform_dir):
-            tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
-            if os.path.exists(tfstate_path):
-                try:
-                    with open(tfstate_path) as f:
-                        return f.read()
-                except Exception as e:
-                    task_logger.warning(f"Could not read terraform state: {e}", category=LogCategory.WARNING)
+        """Snapshot terraform state for the task row.
+
+        With the pg backend the canonical state lives in Postgres; this
+        snapshot is best-effort and used for debugging only. Falls back
+        to reading the local `terraform.tfstate` file for legacy/test
+        modes that don't configure a remote backend.
+        """
+        if not (terraform_dir and os.path.exists(terraform_dir)):
+            return None
+        try:
+            terraform = TerraformExecutor(
+                terraform_dir,
+                env_vars=openstack_env,
+                backend_conn_str=tfstate_conn_str,
+                backend_schema_name=tfstate_schema,
+            )
+            pulled = terraform.state_pull()
+            if pulled:
+                return pulled
+        except Exception as e:
+            task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
+
+        # Legacy fallback — only relevant when no pg backend is configured.
+        tfstate_path = os.path.join(terraform_dir, "terraform.tfstate")
+        if os.path.exists(tfstate_path):
+            try:
+                with open(tfstate_path) as f:
+                    return f.read()
+            except Exception as e:
+                task_logger.warning(f"Could not read terraform state: {e}", category=LogCategory.WARNING)
         return None
 
     def collect_terraform_outputs():
         """Try to collect terraform outputs even on partial success"""
         if terraform_dir and os.path.exists(terraform_dir):
             try:
-                terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
+                terraform = TerraformExecutor(
+                    terraform_dir,
+                    env_vars=openstack_env,
+                    backend_conn_str=tfstate_conn_str,
+                    backend_schema_name=tfstate_schema,
+                )
                 return terraform.output()
             except Exception as e:
                 task_logger.warning(f"Could not read terraform outputs: {e}", category=LogCategory.WARNING)
@@ -129,18 +188,15 @@ def deploy_application(
             teams_keys=list(teams.keys()),
         )
 
-        # Phase 1: OpenStack credentials
+        # Phase 1: OpenStack credentials (envelope only — materialised after
+        # the git clone so the per-task clouds.yaml lives inside repo_path).
         task_logger.phase("OpenStack Setup")
-        task_logger.operation_start("openstack_auth")
-        try:
-            openstack_env = openstack_auth_service.get_environment_variables()
-            if not openstack_env or not openstack_env.get("OS_AUTH_URL"):
-                raise Exception("OpenStack credentials not configured")
-            task_logger.operation_end("openstack_auth", success=True)
-            task_logger.success("OpenStack credentials loaded", category=LogCategory.STATUS)
-        except Exception as e:
-            task_logger.operation_end("openstack_auth", success=False)
-            raise Exception(f"OpenStack error: {str(e)}")
+        if not openstack_envelope:
+            raise Exception("OpenStack credential envelope missing — user must upload " "credentials before deploying")
+        task_logger.success(
+            "OpenStack credential envelope received",
+            category=LogCategory.STATUS,
+        )
 
         # Phase 2: Git clone
         task_logger.phase("Git Repository Setup")
@@ -174,28 +230,67 @@ def deploy_application(
         except Exception as e:
             raise Exception(f"Git clone failed: {str(e)}")
 
-        image_name = app_id + "-" + release
-        # Phase 3: Packer (optional)
+        # Materialise the per-task clouds.yaml inside repo_path with mode 0600.
+        # Lives only for the duration of this task; shredded by __exit__.
+        task_logger.operation_start("openstack_credentials_materialise")
+        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
+        openstack_env = clouds_config.__enter__()
+        task_logger.operation_end("openstack_credentials_materialise", success=True)
+        task_logger.success(
+            "Per-task clouds.yaml written",
+            category=LogCategory.STATUS,
+        )
+
+        # Cache the built image by commit SHA, not by release tag.
+        # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
+        # silently serves stale images when the underlying commit changes. The
+        # short SHA is content-addressed: a new commit always misses the cache.
+        if commit_info and commit_info.get("hash"):
+            image_tag = commit_info["hash"][:8]
+        else:
+            # Commit lookup failed above (warning logged); fall back to release tag.
+            image_tag = release
+        image_name = f"{app_id}-{image_tag}"
+        # Phase 3: Packer (optional) — guarded by a Redis lock keyed on
+        # (project_id, image_name) so two parallel workers can't both kick
+        # off a build for the same image and end up with duplicate Glance
+        # entries plus wasted compute.
         packer_file = os.path.join(repo_path, "packer", "template.pkr.hcl")
         if os.path.exists(packer_file):
             task_logger.phase("Packer Image Build")
+            project_id = openstack_envelope.get("project_id") or openstack_envelope.get("project_name") or "default"
+            build_lock = PackerBuildLock(project_id, image_name)
+            openstack_service = OpenStackService(env_vars=openstack_env)
             try:
-                # Check if image already exists on OpenStack
-                task_logger.info(f"Checking if image '{image_name}' already exists...", category=LogCategory.OPERATION)
-                openstack_service = OpenStackService(env_vars=openstack_env)
-                exists, image_id = openstack_service.check_image_exists(image_name)
+                while True:
+                    # If the image already exists, skip the build and the lock.
+                    exists, image_id = openstack_service.check_image_exists(image_name)
+                    if exists:
+                        task_logger.success(
+                            f"Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
+                            category=LogCategory.STATUS,
+                        )
+                        break
 
-                if exists:
-                    task_logger.success(
-                        f"Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
-                        category=LogCategory.STATUS,
-                    )
-                    # Skip Packer build, continue with Terraform
-                else:
+                    held = build_lock.acquire_or_wait()
+                    if not held:
+                        # We slept inside acquire_or_wait; re-check Glance.
+                        continue
+
+                    # Re-check after acquiring: another worker may have
+                    # finished its build between our last check and our lock
+                    # acquisition.
+                    exists, image_id = openstack_service.check_image_exists(image_name)
+                    if exists:
+                        task_logger.success(
+                            f"Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
+                            category=LogCategory.STATUS,
+                        )
+                        break
+
                     task_logger.info(
                         f"Image '{image_name}' does not exist. Building...", category=LogCategory.OPERATION
                     )
-                    # Perform Packer build
                     packer = PackerExecutor(os.path.join(repo_path, "packer"), env_vars=openstack_env)
 
                     task_logger.info("Initializing Packer plugins...", category=LogCategory.OPERATION)
@@ -207,13 +302,16 @@ def deploy_application(
                     if not success:
                         raise Exception("Packer init failed")
 
-                    print("Packer Variables:")
-                    print(user_vars)
-
                     # Merge user_vars with teams for Packer
                     packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
                     packer_vars["image_name"] = image_name
                     packer_vars = flatten_vars_to_strings(packer_vars)
+
+                    task_logger.info(
+                        "Packer variable keys",
+                        category=LogCategory.OPERATION,
+                        keys=list(packer_vars.keys()),
+                    )
 
                     task_logger.info("Validating Packer template...", category=LogCategory.OPERATION)
                     success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
@@ -229,8 +327,11 @@ def deploy_application(
                         raise Exception(f"Packer build failed: {output}")
 
                     task_logger.success("Packer image built successfully", category=LogCategory.STATUS)
+                    break
             except Exception as e:
                 raise Exception(f"Packer error: {str(e)}")
+            finally:
+                build_lock.release()
         else:
             task_logger.info("No Packer template found, skipping image build", category=LogCategory.SYSTEM)
 
@@ -240,8 +341,15 @@ def deploy_application(
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
 
+        terraform = None
+        terraform_vars: dict[str, Any] = {}
         try:
-            terraform = TerraformExecutor(terraform_dir, env_vars=openstack_env)
+            terraform = TerraformExecutor(
+                terraform_dir,
+                env_vars=openstack_env,
+                backend_conn_str=tfstate_conn_str,
+                backend_schema_name=tfstate_schema,
+            )
 
             task_logger.info("Initializing Terraform...", category=LogCategory.OPERATION)
             success, stdout, stderr = terraform.init()
@@ -264,8 +372,6 @@ def deploy_application(
 
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
-                print(stderr)
-                print(stdout)
                 raise Exception("Terraform plan failed")
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
@@ -290,6 +396,27 @@ def deploy_application(
             # Try to collect partial results even on failure
             tf_state = collect_terraform_state()
             outputs = collect_terraform_outputs()
+
+            # Best-effort cleanup: a half-finished `terraform apply` typically
+            # leaves orphaned OpenStack resources (networks, ports, volumes)
+            # that quietly eat the project's quota. Run destroy with the same
+            # variables so the apply graph can be reversed; ignore failures
+            # here — we're already in the error path and re-raising below.
+            if terraform is not None and terraform_dir and os.path.exists(terraform_dir):
+                try:
+                    task_logger.info(
+                        "Running terraform destroy to clean up partially-applied resources",
+                        category=LogCategory.OPERATION,
+                    )
+                    terraform.destroy(variables=terraform_vars)
+                    # Refresh state after destroy so the persisted record reflects cleanup.
+                    tf_state = collect_terraform_state()
+                except Exception as cleanup_error:
+                    task_logger.warning(
+                        f"Terraform cleanup failed: {cleanup_error}",
+                        category=LogCategory.WARNING,
+                    )
+
             raise Exception(f"Terraform error: {str(e)}")
 
         task_logger.phase("Deployment Complete")
@@ -309,8 +436,6 @@ def deploy_application(
             "commit_info": commit_info,
             "terraform_outputs": outputs,
         }
-
-        print(result)
 
         # Return result (sent via task-succeeded event)
         return result
@@ -335,6 +460,16 @@ def deploy_application(
         )
 
     finally:
+        # Shred the per-task clouds.yaml first so the credential file is gone
+        # even if the repository cleanup below fails or hangs.
+        if clouds_config is not None:
+            try:
+                clouds_config.__exit__(None, None, None)
+            except Exception as e:
+                task_logger.warning(
+                    f"Per-task clouds.yaml cleanup failed: {e}",
+                    category=LogCategory.WARNING,
+                )
         if repo_path:
             try:
                 git_service.cleanup_repository(repo_path)

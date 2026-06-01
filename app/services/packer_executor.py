@@ -28,9 +28,6 @@ class PackerExecutor:
         if extra_env:
             env.update(extra_env)
         env["PACKER_LOG"] = "1"
-        # Ensure clouds.yaml is found by Packer/OpenStack
-        if "OS_CLIENT_CONFIG_FILE" not in env:
-            env["OS_CLIENT_CONFIG_FILE"] = settings.OPENSTACK_CLOUDS_YAML
         return env
 
     def init(self) -> tuple[bool, str, str]:

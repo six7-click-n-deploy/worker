@@ -130,82 +130,48 @@ make docker-build      # Build Docker image
 
 - **Git Service** (`services/git_service.py`): Handles repository cloning and cleanup
 - **Executors** (`services/executors.py`): Wrappers for Terraform and Packer CLI tools with OpenStack env injection
-- **OpenStack Auth** (`services/openstack_auth.py`): Manages OpenStack credentials from YAML files
-- **Database** (`database.py`, `models.py`): Database connection and deployment state management
+- **OpenStack Auth** (`services/openstack_auth.py`): `PerTaskCloudsConfig` context manager. Decrypts the per-user credential envelope received from the backend via Celery (using the shared Fernet key) and materialises a `clouds.yaml` (mode 0600) inside the per-task workspace. The file is shredded on exit.
+- **Build Lock** (`services/build_lock.py`): Redis-backed distributed lock keyed on `(project_id, image_name)` so two parallel workers never run the same Packer build twice.
 
 ### Task Flow
 
-1. **Receive Task**: Celery worker receives deployment task from Redis queue
-2. **Update Status**: Set deployment status to `RUNNING` in database
-3. **Setup OpenStack**: Load credentials from `openstack_auth.yaml` or `clouds.yaml`
-4. **Clone Repository**: Fresh clone of Git repository to temporary directory
-5. **Build Image** (optional): Run Packer if `packer/template.pkr.hcl` exists
-6. **Deploy Infrastructure**: Run Terraform init/plan/apply with OpenStack credentials
-7. **Update Status**: Set status to `SUCCESS` or `FAILED` with commit info
-8. **Cleanup**: Delete cloned repository
+1. **Receive Task**: Celery worker receives the deployment task plus an `openstack_envelope` (ciphertext + non-secret metadata)
+2. **Clone Repository**: Fresh clone of Git repository under `/tmp/worker_repos/deploy_<id>/`
+3. **Materialise credentials**: `PerTaskCloudsConfig` decrypts the envelope in-process and writes `clouds.yaml` into the workspace
+4. **Build Image** (optional): Acquire `PackerBuildLock`, re-check Glance, run Packer if the image is missing
+5. **Deploy Infrastructure**: Terraform init/plan/apply with `OS_CLIENT_CONFIG_FILE` pointing at the per-task `clouds.yaml`
+6. **Cleanup**: Remove the rendered `clouds.yaml` and the cloned repository
 
 ## Configuration
 
 ### Environment Variables (`.env`)
 
 ```bash
-DATABASE_URL=postgresql://postgres:postgres@db:5432/clickndeploy
-CELERY_BROKER_URL=redis://redis:6379/0
-CELERY_RESULT_BACKEND=redis://redis:6379/1
+CELERY_BROKER_URL=amqp://admin:admin@rabbitmq:5672/
+CELERY_RESULT_BACKEND=redis://redis:6379/0
 TEMP_REPO_BASE_PATH=/tmp/worker_repos
 
-# OpenStack Configuration Files
-OPENSTACK_AUTH_YAML=/app/openstack_auth.yaml
-OPENSTACK_CLOUDS_YAML=/app/clouds.yaml
-
-# Or use environment variables directly
-OS_AUTH_URL=https://openstack.example.com:5000/v3
-OS_PROJECT_NAME=my-project
-OS_USERNAME=my-user
-OS_PASSWORD=my-password
-OS_USER_DOMAIN_NAME=Default
-OS_PROJECT_DOMAIN_NAME=Default
-OS_REGION_NAME=RegionOne
+# Symmetric Fernet key shared with the backend. Required.
+# Generate with:
+#   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+CREDENTIAL_ENCRYPTION_KEY=<32-byte-url-safe-base64-key>
 ```
 
 ### OpenStack Authentication
 
-The worker supports three methods for OpenStack authentication (in priority order):
+The worker no longer reads a static `clouds.yaml` from disk or env. Each
+deployment task carries its own per-user credential envelope: the backend
+encrypts the user's `identifier` / `secret` with the shared Fernet key and
+ships the ciphertext (plus non-secret metadata) as the last positional
+argument of the Celery task. `PerTaskCloudsConfig`:
 
-#### 1. clouds.yaml (Recommended for multi-environment)
+1. decrypts the envelope in-process,
+2. writes a `clouds.yaml` with mode `0600` into the per-task workspace,
+3. exports `OS_CLIENT_CONFIG_FILE` and `OS_CLOUD` to Packer / Terraform,
+4. removes the file in `__exit__`.
 
-```yaml
-clouds:
-  production:
-    auth:
-      auth_url: https://openstack.example.com:5000/v3
-      username: prod-user
-      password: prod-password
-      project_name: production
-      user_domain_name: Default
-      project_domain_name: Default
-    region_name: RegionOne
-```
-
-Mount to `/app/clouds.yaml` in container.
-
-#### 2. openstack_auth.yaml (Simple single environment)
-
-```yaml
-auth_url: https://openstack.example.com:5000/v3
-project_name: my-project
-username: my-username
-password: my-password
-user_domain_name: Default
-project_domain_name: Default
-region_name: RegionOne
-```
-
-Mount to `/app/openstack_auth.yaml` in container.
-
-#### 3. Environment Variables (Fallback)
-
-Set `OS_AUTH_URL`, `OS_PROJECT_NAME`, etc. directly in `.env` or docker-compose.
+Plaintext never lands on disk outside the per-task workspace, never reaches
+RabbitMQ, and never appears in Celery's result backend.
 
 ## Development
 
@@ -215,9 +181,8 @@ Set `OS_AUTH_URL`, `OS_PROJECT_NAME`, etc. directly in `.env` or docker-compose.
 # Install dependencies
 pip install -r requirements.txt
 
-# Copy and configure OpenStack credentials
-cp openstack_auth.yaml.example openstack_auth.yaml
-# Edit openstack_auth.yaml with your credentials
+# Set the shared encryption key (must match the backend's value)
+export CREDENTIAL_ENCRYPTION_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 
 # Run worker
 celery -A celery_app worker --loglevel=info
@@ -229,11 +194,8 @@ celery -A celery_app worker --loglevel=info
 # Build image
 docker build -f Dockerfile.dev -t worker:dev .
 
-# Run container with OpenStack config
-docker run \
-  --env-file .env \
-  -v $(pwd)/openstack_auth.yaml:/app/openstack_auth.yaml:ro \
-  worker:dev
+# Run container — credentials arrive per-task via Celery, no volume mounts needed
+docker run --env-file .env worker:dev
 ```
 
 ## Repository Structure
@@ -329,11 +291,10 @@ User input variables from the `userInputVar` field are passed to both Packer and
 
 ## Security
 
-- ⚠️ **Never commit** `openstack_auth.yaml` or `clouds.yaml` to git
-- Mount credential files as read-only in Docker
-- Use environment-specific credentials (dev/staging/prod)
-- Rotate passwords regularly
-- Consider using application credentials instead of user passwords
+- ⚠️ **Never commit** the `CREDENTIAL_ENCRYPTION_KEY` value
+- The key in the worker env must exactly match the backend's `CREDENTIAL_ENCRYPTION_KEY`
+- Per-task `clouds.yaml` files are written with mode `0600` and removed on exit
+- Prefer Application Credentials (`v3applicationcredential`) over passwords; users select per-credential auth type when uploading
 
 ## Monitoring
 
