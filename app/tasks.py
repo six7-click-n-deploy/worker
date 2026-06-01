@@ -29,13 +29,26 @@ def _tfstate_schema_name(deployment_id: str) -> str:
 
 
 class Failure(Exception):
-    """Custom exception that carries deployment details for Celery"""
+    """Custom exception that carries deployment details for Celery.
+
+    The full failure payload is serialised once into ``args[0]`` as a JSON
+    string. The backend's celery event listener parses that JSON back via
+    a ``Failure\\('<json>'\\)`` regex over the traceback.
+
+    Pickling notes: Celery pickles exceptions to ship them through
+    ``task-failed`` events. Because the public ``__init__`` takes six
+    positional arguments while ``args`` only has the JSON string,
+    ``Exception.__reduce__`` couldn't round-trip — Celery wrapped us in
+    ``UnpickleableExceptionWrapper``. We override ``__reduce__`` to
+    reconstruct via the dedicated classmethod ``_from_payload`` which
+    accepts the single JSON string directly.
+    """
 
     def __init__(
         self,
         message: str,
         deployment_id: str,
-        logs_dict: dict[str, Any],
+        logs_dict: list[dict[str, Any]] | dict[str, Any],
         tf_state: str | None = None,
         commit_info: dict[str, Any] | None = None,
         terraform_outputs: dict[str, Any] | None = None,
@@ -57,27 +70,103 @@ class Failure(Exception):
         }
         super().__init__(json.dumps(data))
 
+    @classmethod
+    def _from_payload(cls, payload: str) -> "Failure":
+        """Reconstruct a Failure from the JSON payload it serialised itself into.
+
+        Used by ``__reduce__`` so pickle can round-trip the exception
+        without re-wrapping the JSON in a second ``json.dumps`` call.
+        """
+        data = json.loads(payload)
+        instance = cls.__new__(cls)
+        instance.deployment_id = data.get("deployment_id", "")
+        instance.logs_dict = data.get("logs")
+        instance.tf_state = data.get("tf_state")
+        instance.commit_info = data.get("commit_info")
+        instance.terraform_outputs = data.get("terraform_outputs")
+        Exception.__init__(instance, payload)
+        return instance
+
+    def __reduce__(self):
+        # The single-arg constructor here is ``_from_payload``; args[0] is
+        # the JSON string we built in __init__.
+        return (Failure._from_payload, (self.args[0] if self.args else "{}",))
+
+    def __repr__(self) -> str:
+        # Pin the repr format that the backend's celery event listener
+        # relies on (regex ``Failure\('(.+)'\)``). Python's default repr
+        # for a single-arg exception already matches, but spelling it out
+        # makes the contract explicit and decouples us from interpreter
+        # changes that affect the default formatting.
+        return f"Failure({self.args[0]!r})" if self.args else "Failure()"
+
     def to_dict(self) -> dict[str, Any]:
         """Convert exception data to dict for serialization"""
         return json.loads(str(self))
 
 
-# --- Hilfsfunktion: user_vars auf erster Ebene in Strings umwandeln, Backslashes entfernen ---
-def flatten_vars_to_strings(d):
+# --- Variable encoding for Packer/Terraform CLI ----------------------------
+#
+# The previous helper (`flatten_vars_to_strings`) called `s.replace("\\", "")`
+# on every value, which silently destroyed escaped quotes inside JSON-encoded
+# nested structures (e.g. `users={"Team-1":[{"email":"foo"}]}`). HCL then
+# rejected the malformed value during `terraform plan`, but the failure
+# surfaced only as the opaque message "Terraform plan failed" because we did
+# not forward the plan's stderr. Both bugs are fixed here and at the call
+# sites below.
+
+
+def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
+    """Encode variables for ``terraform -var key=value`` CLI args.
+
+    Terraform reads complex types (objects, tuples) when the value is a
+    valid JSON literal. We JSON-encode dicts/lists once and pass them
+    through verbatim — no string normalisation that could damage escape
+    sequences.
     """
-    Wandelt alle Werte auf der ersten Ebene eines dict in Strings um (außer None),
-    Listen werden zu kommaseparierten Strings, entfernt Backslashes.
+    result: dict[str, str] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            # HCL accepts lowercase only; ``str(True)`` would emit "True".
+            result[k] = "true" if v else "false"
+        elif isinstance(v, (dict, list)):
+            result[k] = json.dumps(v, ensure_ascii=False)
+        else:
+            result[k] = str(v)
+    return result
+
+
+def encode_packer_vars(d: dict[str, Any]) -> dict[str, str]:
+    """Encode variables for ``packer -var key=value`` CLI args.
+
+    Mirrors the historical Packer behaviour: lists are joined as
+    comma-separated strings (the project's Packer templates split them
+    again internally). The destructive backslash-stripping the old helper
+    performed is dropped — string values are passed through verbatim.
     """
-    result = {}
+    result: dict[str, str] = {}
     for k, v in d.items():
         if v is None:
             continue
         if isinstance(v, list):
-            s = ",".join(str(x) for x in v if x is not None)
-            result[k] = s.replace("\\", "")
+            result[k] = ",".join(str(x) for x in v if x is not None)
+        elif isinstance(v, dict):
+            # No Packer template currently expects nested objects; JSON-encode
+            # defensively so a future template that does parse them works.
+            result[k] = json.dumps(v, ensure_ascii=False)
+        elif isinstance(v, bool):
+            result[k] = "true" if v else "false"
         else:
-            result[k] = str(v).replace("\\", "")
+            result[k] = str(v)
     return result
+
+
+# Back-compat alias for any external import. Defaults to the Packer
+# semantics (lists → comma-joined) which matches the old helper's intent
+# but no longer strips backslashes.
+flatten_vars_to_strings = encode_packer_vars
 
 
 @celery_app.task(bind=True, name="tasks.deploy_application")
@@ -305,7 +394,7 @@ def deploy_application(
                     # Merge user_vars with teams for Packer
                     packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
                     packer_vars["image_name"] = image_name
-                    packer_vars = flatten_vars_to_strings(packer_vars)
+                    packer_vars = encode_packer_vars(packer_vars)
 
                     task_logger.info(
                         "Packer variable keys",
@@ -354,24 +443,43 @@ def deploy_application(
             task_logger.info("Initializing Terraform...", category=LogCategory.OPERATION)
             success, stdout, stderr = terraform.init()
             if not success:
+                # Surface the real reason in the per-deployment log; the
+                # module-level logger only writes to worker stdout, which the
+                # frontend never sees.
+                if stdout:
+                    task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
+                if stderr:
+                    task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
+                task_logger.error("Terraform init failed", category=LogCategory.ERROR)
                 raise Exception("Terraform init failed")
             task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
 
             task_logger.info("Planning Terraform deployment...", category=LogCategory.OPERATION)
 
-            # Merge user_vars with teams for Terraform
+            # Merge user_vars with teams for Terraform. Pass nested
+            # structures through encode_terraform_vars unchanged — the
+            # previous implementation stripped backslashes and corrupted
+            # escaped quotes inside the JSON for ``users``, which is what
+            # caused the silent ``terraform plan`` failure.
             terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
             terraform_vars["image_name"] = image_name
             if teams:
                 terraform_vars["users"] = teams
-            # Serialisiere dicts/lists für Terraform korrekt als JSON-String (z.B. users)
-            for k, v in list(terraform_vars.items()):
-                if isinstance(v, (dict, list)):
-                    terraform_vars[k] = json.dumps(v)
-            terraform_vars = flatten_vars_to_strings(terraform_vars)
+            terraform_vars = encode_terraform_vars(terraform_vars)
+
+            task_logger.info(
+                "Terraform variable keys",
+                category=LogCategory.OPERATION,
+                keys=list(terraform_vars.keys()),
+            )
 
             success, stdout, stderr = terraform.plan(variables=terraform_vars)
             if not success:
+                if stdout:
+                    task_logger.command_output("terraform_plan_stdout", stdout, returncode=1)
+                if stderr:
+                    task_logger.command_output("terraform_plan_stderr", stderr, returncode=1)
+                task_logger.error("Terraform plan failed", category=LogCategory.ERROR)
                 raise Exception("Terraform plan failed")
             task_logger.success("Terraform plan completed successfully", category=LogCategory.STATUS)
 
@@ -380,6 +488,11 @@ def deploy_application(
             )
             success, stdout, stderr = terraform.apply(variables=terraform_vars)
             if not success:
+                if stdout:
+                    task_logger.command_output("terraform_apply_stdout", stdout, returncode=1)
+                if stderr:
+                    task_logger.command_output("terraform_apply_stderr", stderr, returncode=1)
+                task_logger.error("Terraform apply failed", category=LogCategory.ERROR)
                 raise Exception("Terraform apply failed")
             task_logger.success("Terraform resources created", category=LogCategory.STATUS)
 
