@@ -1,84 +1,185 @@
-"""
-OpenStack authentication service for setting up credentials
+"""Per-task OpenStack credential materialization.
+
+The worker receives an encrypted credential envelope on the Celery task args
+(see backend `crud.openstack_credentials.get_dispatch_envelope`). This module
+decrypts the envelope in-process and writes a `clouds.yaml` (mode 0600) into
+the per-deployment workspace for the duration of one task. The file is
+removed eagerly when the context manager exits — so, even on a crash, the
+plaintext credential lives on disk only for the active phase of the build.
+
+The plaintext is never logged. The `creds` dict is wiped from memory in
+`__exit__` so the GC can reclaim it quickly.
 """
 
-import logging
+from __future__ import annotations
+
+import base64
 import os
 from typing import Any
 
 import yaml
 
-from ..config import settings
-
-logger = logging.getLogger(__name__)
+from ..utils.crypto import decrypt
 
 
-class OpenStackAuthService:
-    """Service for managing OpenStack authentication"""
+class CredentialEnvelopeError(Exception):
+    """Raised when the dispatched envelope is missing fields or fails to decrypt."""
 
-    def __init__(self):
-        self.clouds_yaml_path = settings.OPENSTACK_CLOUDS_YAML
 
-    def load_clouds_yaml(self) -> dict[str, Any] | None:
-        """
-        Load OpenStack clouds.yaml configuration
+class PerTaskCloudsConfig:
+    """Context manager: materialize a per-task `clouds.yaml`, then shred it.
 
-        Returns:
-            dict: Clouds configuration or None if not found
-        """
+    Usage:
+        with PerTaskCloudsConfig(envelope, work_dir=repo_path) as env:
+            packer.run(env_vars=env)
+            terraform.run(env_vars=env)
+    """
+
+    CLOUD_NAME = "deployment"
+
+    def __init__(self, envelope: dict[str, Any], work_dir: str):
+        if not isinstance(envelope, dict):
+            raise CredentialEnvelopeError("OpenStack credential envelope is missing or invalid")
+
         try:
-            if os.path.exists(self.clouds_yaml_path):
-                with open(self.clouds_yaml_path) as f:
-                    clouds_config = yaml.safe_load(f)
-                    logger.info(f"Loaded clouds.yaml from {self.clouds_yaml_path}")
-                    return clouds_config
-            else:
-                logger.warning(f"clouds.yaml not found at {self.clouds_yaml_path}")
-                return None
+            id_b64 = envelope["encrypted_identifier_b64"]
+            secret_b64 = envelope["encrypted_secret_b64"]
+            auth_type = envelope["auth_type"]
+            auth_url = envelope["auth_url"]
+        except KeyError as e:
+            raise CredentialEnvelopeError(f"OpenStack credential envelope missing field: {e}")
+
+        try:
+            identifier = decrypt(base64.b64decode(id_b64.encode("ascii")))
+            secret = decrypt(base64.b64decode(secret_b64.encode("ascii")))
         except Exception as e:
-            logger.error(f"Failed to load clouds.yaml: {e}")
-            return None
+            # Don't surface InvalidToken text — only the type — to keep logs clean.
+            raise CredentialEnvelopeError(
+                f"Failed to decrypt OpenStack credential envelope ({type(e).__name__}). "
+                "Check that backend and worker share the same CREDENTIAL_ENCRYPTION_KEY."
+            )
 
-    def get_environment_variables(self, cloud_name: str = "openstack") -> dict[str, str]:
-        """
-        Get OpenStack environment variables from clouds.yaml
+        self._creds: dict[str, Any] | None = {
+            "auth_type": auth_type,
+            "auth_url": auth_url,
+            "region_name": envelope.get("region_name"),
+            "interface": envelope.get("interface") or "public",
+            "identity_api_version": envelope.get("identity_api_version") or "3",
+            "project_id": envelope.get("project_id"),
+            "project_name": envelope.get("project_name"),
+            "user_domain_name": envelope.get("user_domain_name"),
+            "project_domain_name": envelope.get("project_domain_name") or envelope.get("user_domain_name"),
+            "_identifier": identifier,
+            "_secret": secret,
+        }
 
-        Args:
-            cloud_name: Name of the cloud to use from clouds.yaml
+        os.makedirs(work_dir, exist_ok=True)
+        self.path = os.path.join(work_dir, "clouds.yaml")
 
-        Returns:
-            dict: Environment variables for OpenStack authentication
-        """
-        clouds_config = self.load_clouds_yaml()
-        if not clouds_config or cloud_name not in clouds_config.get("clouds", {}):
-            logger.warning(f"Cloud '{cloud_name}' not found in clouds.yaml")
-            return {}
+    def _cloud_block(self) -> dict[str, Any]:
+        c = self._creds
+        if c is None:
+            raise CredentialEnvelopeError("Credentials already shredded")
 
-        cloud_config = clouds_config["clouds"][cloud_name]
-        auth_config = cloud_config.get("auth", {})
+        block: dict[str, Any] = {
+            "auth_type": c["auth_type"],
+            "auth": {"auth_url": c["auth_url"]},
+            "interface": c["interface"],
+            "identity_api_version": c["identity_api_version"],
+        }
+        if c["region_name"]:
+            block["region_name"] = c["region_name"]
 
-        # Map clouds.yaml auth fields to OpenStack environment variables
-        env_vars = {}
+        auth = block["auth"]
+        if c["auth_type"] == "v3applicationcredential":
+            auth["application_credential_id"] = c["_identifier"]
+            auth["application_credential_secret"] = c["_secret"]
+        else:
+            auth["username"] = c["_identifier"]
+            auth["password"] = c["_secret"]
+            if c["project_id"]:
+                auth["project_id"] = c["project_id"]
+            if c["project_name"]:
+                auth["project_name"] = c["project_name"]
+            if c["user_domain_name"]:
+                auth["user_domain_name"] = c["user_domain_name"]
+            if c["project_domain_name"]:
+                auth["project_domain_name"] = c["project_domain_name"]
+        return block
 
-        # Standard OpenStack environment variables
-        env_vars["OS_AUTH_URL"] = auth_config.get("auth_url", "")
-        env_vars["OS_PROJECT_ID"] = auth_config.get("project_id", "")
-        env_vars["OS_PROJECT_NAME"] = auth_config.get("project_name", "")
-        env_vars["OS_USER_DOMAIN_NAME"] = auth_config.get("user_domain_name", "Default")
-        env_vars["OS_USERNAME"] = auth_config.get("username", "")
-        env_vars["OS_PASSWORD"] = auth_config.get("password", "")
-        env_vars["OS_REGION_NAME"] = auth_config.get("region_name", "")
+    def _env_vars(self) -> dict[str, str]:
+        """Mirror selected creds into OS_* env vars for tools that ignore clouds.yaml."""
+        c = self._creds or {}
+        env: dict[str, str] = {}
+        if c.get("auth_url"):
+            env["OS_AUTH_URL"] = c["auth_url"]
+        if c.get("region_name"):
+            env["OS_REGION_NAME"] = c["region_name"]
+        if c.get("interface"):
+            env["OS_INTERFACE"] = c["interface"]
+        if c.get("identity_api_version"):
+            env["OS_IDENTITY_API_VERSION"] = c["identity_api_version"]
 
-        # Additional cloud-specific settings
-        if "region_name" in cloud_config:
-            env_vars["OS_REGION_NAME"] = cloud_config["region_name"]
+        if c.get("auth_type") == "v3applicationcredential":
+            env["OS_AUTH_TYPE"] = "v3applicationcredential"
+            env["OS_APPLICATION_CREDENTIAL_ID"] = c["_identifier"]
+            env["OS_APPLICATION_CREDENTIAL_SECRET"] = c["_secret"]
+        else:
+            env["OS_AUTH_TYPE"] = "password"
+            env["OS_USERNAME"] = c["_identifier"]
+            env["OS_PASSWORD"] = c["_secret"]
+            if c.get("project_id"):
+                env["OS_PROJECT_ID"] = c["project_id"]
+            if c.get("project_name"):
+                env["OS_PROJECT_NAME"] = c["project_name"]
+            if c.get("user_domain_name"):
+                env["OS_USER_DOMAIN_NAME"] = c["user_domain_name"]
+            if c.get("project_domain_name"):
+                env["OS_PROJECT_DOMAIN_NAME"] = c["project_domain_name"]
+        return env
 
-        # Filter out empty values
-        env_vars = {k: v for k, v in env_vars.items() if v}
+    def __enter__(self) -> dict[str, str]:
+        # O_EXCL: refuse to overwrite a stale file from a previous task that
+        # crashed before reaching its `__exit__`. mode 0600 is enforced by
+        # the syscall, not by a separate chmod (no race window).
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except FileExistsError:
+            # A stale file means a prior task in this same workspace died. Clean and retry.
+            try:
+                os.remove(self.path)
+            except FileNotFoundError:
+                pass
+            fd = os.open(self.path, flags, 0o600)
 
-        logger.info(f"Loaded OpenStack environment variables for cloud '{cloud_name}'")
-        return env_vars
+        try:
+            with os.fdopen(fd, "w") as f:
+                yaml.safe_dump(
+                    {"clouds": {self.CLOUD_NAME: self._cloud_block()}},
+                    f,
+                    default_flow_style=False,
+                )
+        except Exception:
+            try:
+                os.remove(self.path)
+            except FileNotFoundError:
+                pass
+            raise
 
+        env = {
+            "OS_CLIENT_CONFIG_FILE": self.path,
+            "OS_CLOUD": self.CLOUD_NAME,
+        }
+        env.update(self._env_vars())
+        return env
 
-# Singleton instance
-openstack_auth_service = OpenStackAuthService()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # Shred file eagerly. The repo workspace cleanup in tasks.py:finally
+        # would also remove it, but doing it here narrows the window.
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+        # Drop plaintext references; let GC reclaim them quickly.
+        self._creds = None
