@@ -10,11 +10,11 @@ import re
 import time
 import traceback
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class LogLevel(str, Enum):
+class LogLevel(StrEnum):
     """Standard log levels"""
 
     DEBUG = "DEBUG"
@@ -24,7 +24,7 @@ class LogLevel(str, Enum):
     ERROR = "ERROR"
 
 
-class LogCategory(str, Enum):
+class LogCategory(StrEnum):
     """Log categories for filtering and organization"""
 
     PHASE = "phase"  # Major phase transitions

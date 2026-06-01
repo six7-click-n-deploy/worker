@@ -14,6 +14,7 @@ The plaintext is never logged. The `creds` dict is wiped from memory in
 from __future__ import annotations
 
 import base64
+import contextlib
 import os
 from typing import Any
 
@@ -147,10 +148,8 @@ class PerTaskCloudsConfig:
             fd = os.open(self.path, flags, 0o600)
         except FileExistsError:
             # A stale file means a prior task in this same workspace died. Clean and retry.
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(self.path)
-            except FileNotFoundError:
-                pass
             fd = os.open(self.path, flags, 0o600)
 
         try:
@@ -161,10 +160,8 @@ class PerTaskCloudsConfig:
                     default_flow_style=False,
                 )
         except Exception:
-            try:
+            with contextlib.suppress(FileNotFoundError):
                 os.remove(self.path)
-            except FileNotFoundError:
-                pass
             raise
 
         env = {
@@ -177,9 +174,7 @@ class PerTaskCloudsConfig:
     def __exit__(self, exc_type, exc, tb) -> None:
         # Shred file eagerly. The repo workspace cleanup in tasks.py:finally
         # would also remove it, but doing it here narrows the window.
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.remove(self.path)
-        except FileNotFoundError:
-            pass
         # Drop plaintext references; let GC reclaim them quickly.
         self._creds = None

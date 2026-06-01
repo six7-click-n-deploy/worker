@@ -245,11 +245,7 @@ def deploy_application(
         # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
         # silently serves stale images when the underlying commit changes. The
         # short SHA is content-addressed: a new commit always misses the cache.
-        if commit_info and commit_info.get("hash"):
-            image_tag = commit_info["hash"][:8]
-        else:
-            # Commit lookup failed above (warning logged); fall back to release tag.
-            image_tag = release
+        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         image_name = f"{app_id}-{image_tag}"
         # Phase 3: Packer (optional) — guarded by a Redis lock keyed on
         # (project_id, image_name) so two parallel workers can't both kick
