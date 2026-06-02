@@ -20,6 +20,7 @@ thread also writes phase markers, so buffer access goes through an ``RLock``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -441,7 +442,7 @@ class StructuredLogger:
         """
         pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
         if self._event_emitter is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._event_emitter(
                     self.PROGRESS_EVENT_NAME,
                     {
@@ -454,8 +455,6 @@ class StructuredLogger:
                         "iso_timestamp": _now_iso(),
                     },
                 )
-            except Exception:
-                pass
 
     def operation_start(self, operation_name: str, **context: Any) -> None:
         if self.track_timing:

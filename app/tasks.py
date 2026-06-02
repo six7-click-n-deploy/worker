@@ -443,11 +443,7 @@ def deploy_application(
         # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
         # silently serves stale images when the underlying commit changes. The
         # short SHA is content-addressed: a new commit always misses the cache.
-        if commit_info and commit_info.get("hash"):
-            image_tag = commit_info["hash"][:8]
-        else:
-            # Commit lookup failed above (warning logged); fall back to release tag.
-            image_tag = release
+        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         image_name = f"{app_id}-{image_tag}"
 
         # Decide once whether this deployment needs a Packer build, and
@@ -869,10 +865,7 @@ def destroy_deployment(
         # Glance still has the image, even if we won't be using it; the
         # variable just has to be a non-empty string that satisfies the
         # HCL declaration.
-        if commit_info and commit_info.get("hash"):
-            image_tag = commit_info["hash"][:8]
-        else:
-            image_tag = release
+        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         image_name = f"{app_id}-{image_tag}"
 
         terraform_dir = os.path.join(repo_path, "terraform")
