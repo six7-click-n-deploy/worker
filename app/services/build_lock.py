@@ -123,8 +123,7 @@ class PackerBuildLock:
             return True
         if time.monotonic() > self.deadline:
             raise TimeoutError(
-                f"Timed out waiting for Packer build lock {self.key} "
-                f"(another worker is still building this image)"
+                f"Timed out waiting for Packer build lock {self.key} " f"(another worker is still building this image)"
             )
         # Look up the lock's remaining TTL so the operator/log reader has
         # a hint at how long the wait will be. ``pttl`` returns -2 if the
@@ -205,7 +204,7 @@ class PackerBuildLock:
 
     # ----- context manager ergonomics -----------------------------------
 
-    def __enter__(self) -> "PackerBuildLock":
+    def __enter__(self) -> PackerBuildLock:
         return self
 
     def __exit__(self, *exc_info: object) -> None:

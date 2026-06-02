@@ -14,7 +14,8 @@ import json
 import os
 import subprocess
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ..config import settings
 from ..utils.logger import LogCategory, get_logger
@@ -75,7 +76,7 @@ def _stream_subprocess(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,  # line-buffered — without this, output is held until
-                    # Terraform fills its 64 KiB pipe buffer
+        # Terraform fills its 64 KiB pipe buffer
         env=env,
         start_new_session=True,
     )

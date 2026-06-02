@@ -27,10 +27,11 @@ import re
 import threading
 import time
 import traceback
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Callable, Mapping
+from typing import Any
 
 # ----------------------------------------------------------------------------
 # Public enums
@@ -76,7 +77,7 @@ _LEVEL_ICONS: dict[LogLevel, str] = {
 
 def _now_iso() -> str:
     """Current UTC time as ISO-8601 with explicit ``Z`` suffix."""
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def clean_text(text: str) -> str:
