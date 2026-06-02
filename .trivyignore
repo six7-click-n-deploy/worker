@@ -1,0 +1,34 @@
+# Trivy ignore file
+#
+# Format: one CVE / misconfig ID per line. Anything after `#` is a
+# comment. Document *why* a finding is suppressed so reviewers can
+# revisit when the upstream advisory changes.
+
+# AVD-DS-0002: Dockerfile/Dockerfile.dev run as root.
+# The worker invokes terraform / packer / openstack CLI against
+# bind-mounted git repos. Switching to non-root requires verifying
+# that all three toolchains can write into /tmp/worker_repos and
+# .terraform plugin caches without permission issues — and that
+# bind-mount UIDs line up on macOS + Linux. Tracked in #16.
+AVD-DS-0002
+
+# Packer upstream CVE backlog — Packer's latest release (v1.15.3)
+# still ships with Go 1.25.9 and a handful of outdated modules.
+# Nothing to fix on our side; we just bump PACKER_VERSION when
+# HashiCorp ships a release built against Go 1.25.10+. Tracked
+# in #18.
+#
+# Go stdlib (fixed in 1.25.10):
+CVE-2026-33811
+CVE-2026-33814
+CVE-2026-39820
+CVE-2026-39823
+CVE-2026-39825
+CVE-2026-39826
+CVE-2026-39836
+CVE-2026-42499
+# Go modules pulled in by Packer:
+CVE-2026-46680
+CVE-2026-44973
+CVE-2026-45022
+
