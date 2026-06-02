@@ -1,22 +1,44 @@
+"""Structured logging for deployment tasks.
+
+Three concerns are kept separate here:
+
+* **Buffer** — every log entry is appended to an in-memory list so the worker
+  task can hand the whole transcript back to the backend on completion.
+* **Console sink** — entries are also rendered once to the standard Python
+  logger so they appear in the worker container's stdout. The earlier version
+  re-rendered each entry into both the buffer and the Python logger from
+  inside the same method; the rewrite moves rendering into a dedicated sink
+  to make the double-printing obvious if it ever comes back.
+* **Event sink** — an optional callable that ships every entry to a
+  downstream consumer. The deploy task wires the Celery event bus here so
+  the backend's listener can stream entries to the browser.
+
+A single ``StructuredLogger`` orchestrates these. The class is threadsafe:
+``Popen`` line readers may write from a reader thread while the main task
+thread also writes phase markers, so buffer access goes through an ``RLock``.
 """
-Structured and comprehensive logging utility for deployment tasks.
-Provides detailed, JSON-serializable logging with categories, timing, and context.
-Designed for backend integration with complete event tracking.
-"""
+
+from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
 import time
 import traceback
-from datetime import datetime
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+# ----------------------------------------------------------------------------
+# Public enums
+# ----------------------------------------------------------------------------
+
 
 class LogLevel(str, Enum):
-    """Standard log levels"""
-
     DEBUG = "DEBUG"
     INFO = "INFO"
     SUCCESS = "SUCCESS"
@@ -25,314 +47,573 @@ class LogLevel(str, Enum):
 
 
 class LogCategory(str, Enum):
-    """Log categories for filtering and organization"""
+    PHASE = "phase"
+    OPERATION = "operation"
+    SYSTEM = "system"
+    STATUS = "status"
+    OUTPUT = "output"
+    ERROR = "error"
+    DEBUG = "debug"
+    PROGRESS = "progress"
+    # Kept for backwards compatibility with call sites that pass
+    # ``category=LogCategory.WARNING``. Treated identically to SYSTEM in
+    # rendering — the level (``warning``) carries the actual severity.
+    WARNING = "warning"
 
-    PHASE = "phase"  # Major phase transitions
-    OPERATION = "operation"  # Specific operations (git, terraform, packer)
-    SYSTEM = "system"  # System/infrastructure info
-    STATUS = "status"  # Status updates
-    OUTPUT = "output"  # Tool output (git, terraform, packer)
-    ERROR = "error"  # Error information
-    DEBUG = "debug"  # Debug information
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_LEVEL_ICONS: dict[LogLevel, str] = {
+    LogLevel.DEBUG: "🔍",
+    LogLevel.INFO: "ℹ️",
+    LogLevel.SUCCESS: "✓",
+    LogLevel.WARNING: "⚠️",
+    LogLevel.ERROR: "❌",
+}
+
+
+def _now_iso() -> str:
+    """Current UTC time as ISO-8601 with explicit ``Z`` suffix."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def clean_text(text: str) -> str:
-    """Remove ANSI escape codes and normalize text"""
-    # Remove ANSI color codes
-    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-    text = ansi_escape.sub("", text)
-
-    # Normalize whitespace (single spaces, trim lines)
-    text = text.strip()
-
-    return text
+    """Strip ANSI escapes and trim whitespace."""
+    return _ANSI_RE.sub("", text).strip()
 
 
 def truncate_text(text: str, max_lines: int = 50, max_chars: int = 5000) -> str:
-    """Truncate very long outputs intelligently"""
-    # Truncate by character count first
-    if len(text) > max_chars:
-        text = text[:max_chars] + f"\n... (truncated, {len(text) - max_chars} more characters)"
+    """Truncate text intelligently for the buffered transcript.
 
+    For tool output the *tail* almost always matters more than the
+    head — Terraform/Packer print the error block last, and naively
+    cutting off the end (``text[:max_chars]``) systematically hides
+    the very thing we wanted to log. So the strategy is:
+
+    * Line-cap first: if there are more lines than ``max_lines``, keep
+      the first 15 and the last ``max_lines - 16`` so the trailing
+      error block survives.
+    * Char-cap second, but split the budget between head and tail
+      (40% / 60%) instead of dropping the tail entirely.
+    """
     lines = text.split("\n")
-
     if len(lines) > max_lines:
-        # Keep first 15 lines and last 20 lines
-        kept = lines[:15] + [f"... (truncated {len(lines) - 35} lines) ..."] + lines[-20:]
-        return "\n".join(kept)
+        tail_keep = max_lines - 16
+        lines = lines[:15] + [f"... (truncated {len(lines) - 15 - tail_keep} lines) ..."] + lines[-tail_keep:]
+        text = "\n".join(lines)
+
+    if len(text) > max_chars:
+        head_budget = max_chars * 4 // 10
+        tail_budget = max_chars - head_budget - 64  # leave room for the marker
+        head = text[:head_budget]
+        tail = text[-tail_budget:]
+        text = head + f"\n... (truncated {len(text) - head_budget - tail_budget} characters) ...\n" + tail
 
     return text
 
 
+def _scalar_or_str(value: Any) -> Any:
+    """Coerce one context value into a JSON-friendly scalar.
+
+    Tools like ``orjson`` would handle anything; we default to the stdlib
+    ``json`` module for portability, so we down-cast unknown types to their
+    repr.
+    """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {k: _scalar_or_str(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scalar_or_str(v) for v in value]
+    return str(value)
+
+
+# ----------------------------------------------------------------------------
+# LogEntry
+# ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
 class LogEntry:
-    """Single structured log entry with complete metadata"""
+    """A single log entry with explicit slots for common metadata.
 
-    def __init__(
-        self,
-        message: str,
-        level: LogLevel = LogLevel.INFO,
-        category: LogCategory = LogCategory.SYSTEM,
-        context: dict[str, Any] | None = None,
-        operation: str | None = None,
-        duration_ms: float | None = None,
-    ):
-        self.timestamp = datetime.utcnow().isoformat() + "Z"
-        self.message = clean_text(str(message))
-        self.level = level
-        self.category = category
-        self.operation = operation
-        self.duration_ms = duration_ms
-        self.context = self._clean_context(context or {})
+    Putting ``stdout``/``stderr``/``tool``/``phase`` etc. on the dataclass
+    instead of leaving everything in a generic context dict means consumers
+    (the frontend, the backend listener, the JSON exporter) can render those
+    fields specifically — e.g. monospace blocks for tool output rather than a
+    bag of strings inside ``extra``.
+    """
 
-        # For long outputs, mark as truncated
-        self.truncated = len(self.message) > 2000
-        if self.truncated:
-            self.message = truncate_text(self.message, max_lines=50, max_chars=5000)
-
-    @staticmethod
-    def _clean_context(context: dict[str, Any]) -> dict[str, Any]:
-        """Clean context values for JSON serialization"""
-        cleaned = {}
-        for key, value in context.items():
-            if isinstance(value, (str, int, float, bool, type(None))):
-                cleaned[key] = value
-            elif isinstance(value, dict):
-                cleaned[key] = LogEntry._clean_context(value)
-            elif isinstance(value, (list, tuple)):
-                cleaned[key] = [str(v) for v in value]
-            else:
-                cleaned[key] = str(value)
-        return cleaned
+    timestamp: str
+    level: LogLevel
+    category: LogCategory
+    message: str
+    correlation_id: str | None = None
+    operation: str | None = None
+    duration_ms: float | None = None
+    tool: str | None = None
+    returncode: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    phase: str | None = None
+    progress_pct: int | None = None
+    streaming: bool = False
+    truncated: bool = False
+    extra: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for JSON serialization"""
-        entry_dict = {
+        """Flat JSON-serialisable representation; ``None`` fields are skipped."""
+        d: dict[str, Any] = {
             "timestamp": self.timestamp,
             "level": self.level.value,
             "category": self.category.value,
             "message": self.message,
         }
-
-        if self.operation:
-            entry_dict["operation"] = self.operation
-
-        if self.duration_ms is not None:
-            entry_dict["duration_ms"] = round(self.duration_ms, 2)
-
+        for key in (
+            "correlation_id",
+            "operation",
+            "duration_ms",
+            "tool",
+            "returncode",
+            "stdout",
+            "stderr",
+            "phase",
+            "progress_pct",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                d[key] = round(value, 2) if key == "duration_ms" else value
+        if self.streaming:
+            d["streaming"] = True
         if self.truncated:
-            entry_dict["truncated"] = True
-
-        # Merge context
-        entry_dict.update(self.context)
-
-        return entry_dict
+            d["truncated"] = True
+        if self.extra:
+            # Merge into top-level for backwards compatibility with the old
+            # consumer code that flat-merged context into the entry dict.
+            for k, v in self.extra.items():
+                if k not in d:
+                    d[k] = v
+        return d
 
     def __str__(self) -> str:
-        """Format for console output"""
-        icon = self._get_icon()
-        duration_str = f" [{self.duration_ms:.2f}ms]" if self.duration_ms else ""
-        return f"{icon} [{self.timestamp}] {self.message}{duration_str}"
+        icon = _LEVEL_ICONS.get(self.level, "•")
+        duration = f" [{self.duration_ms:.2f}ms]" if self.duration_ms is not None else ""
+        return f"{icon} [{self.timestamp}] {self.message}{duration}"
 
-    def _get_icon(self) -> str:
-        """Get emoji icon for log level"""
-        icons = {
-            LogLevel.DEBUG: "🔍",
-            LogLevel.INFO: "ℹ️",
-            LogLevel.SUCCESS: "✓",
-            LogLevel.WARNING: "⚠️",
-            LogLevel.ERROR: "❌",
+
+# ----------------------------------------------------------------------------
+# Sinks
+# ----------------------------------------------------------------------------
+
+
+class _Buffer:
+    """Threadsafe append-only list of entries.
+
+    ``RLock`` because export methods (``get_logs_dict``) iterate while a
+    second thread (``Popen`` reader) may still be appending. Using ``list``
+    + lock is plenty for our throughput; a queue/deque would be overkill.
+    """
+
+    def __init__(self) -> None:
+        self._entries: list[LogEntry] = []
+        self._lock = threading.RLock()
+
+    def append(self, entry: LogEntry) -> None:
+        with self._lock:
+            self._entries.append(entry)
+
+    def snapshot(self) -> list[LogEntry]:
+        with self._lock:
+            return list(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+class _ConsoleSink:
+    """Write each entry to the standard Python logger exactly once.
+
+    Disabled via ``WORKER_LOG_CONSOLE=0`` — useful in tests where pytest's
+    capture and our own buffer would otherwise both grow.
+    """
+
+    def __init__(self, name: str, enabled: bool) -> None:
+        self._logger = logging.getLogger(name)
+        self._enabled = enabled
+        self._method: dict[LogLevel, Callable[[str], None]] = {
+            LogLevel.DEBUG: self._logger.debug,
+            LogLevel.INFO: self._logger.info,
+            LogLevel.SUCCESS: self._logger.info,
+            LogLevel.WARNING: self._logger.warning,
+            LogLevel.ERROR: self._logger.error,
         }
-        return icons.get(self.level, "•")
+
+    def write(self, entry: LogEntry) -> None:
+        if not self._enabled:
+            return
+        self._method.get(entry.level, self._logger.info)(str(entry))
+
+
+EventEmitter = Callable[[str, dict[str, Any]], None]
+"""Signature: ``emit(event_name, payload_dict) -> None``.
+
+The deploy task plugs Celery's ``self.send_event`` here so every log entry
+also turns into a ``task-log`` event on the bus. ``None`` disables it.
+"""
+
+
+# ----------------------------------------------------------------------------
+# StructuredLogger
+# ----------------------------------------------------------------------------
 
 
 class StructuredLogger:
-    """Structured logger for tasks and operations with comprehensive tracking"""
+    """Buffer + console + optional event-bus emitter for one deployment task.
 
-    def __init__(self, name: str, track_timing: bool = True):
+    Public method shape mirrors the previous logger so existing call sites in
+    ``tasks.py`` and the executors compile unchanged.
+    """
+
+    LOG_EVENT_NAME = "task-log"
+    PROGRESS_EVENT_NAME = "task-progress"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        correlation_id: str | None = None,
+        console: bool = True,
+        event_emitter: EventEmitter | None = None,
+        track_timing: bool = True,
+    ) -> None:
         self.name = name
-        self.logger = logging.getLogger(name)
-        self.logs: list[LogEntry] = []
+        self.correlation_id = correlation_id
         self.track_timing = track_timing
-        self._operation_stack: list[tuple[str, float]] = []  # Stack for nested operations
+        self._buffer = _Buffer()
+        self._console = _ConsoleSink(name, console and os.environ.get("WORKER_LOG_CONSOLE", "1") != "0")
+        self._event_emitter = event_emitter
+        self._operation_stack: list[tuple[str, float]] = []
+        self._stack_lock = threading.Lock()
 
-    # ============ Core Logging Methods ============
+    # ----- emitter wiring (settable post-construction) --------------------
 
-    def debug(self, message: str, category: LogCategory = LogCategory.DEBUG, **context) -> None:
-        """Log debug message"""
-        entry = LogEntry(message, LogLevel.DEBUG, category, context if context else None)
-        self._record(entry)
+    def set_event_emitter(self, emitter: EventEmitter | None) -> None:
+        """Attach or detach the Celery-event sink at runtime.
 
-    def info(self, message: str, category: LogCategory = LogCategory.SYSTEM, **context) -> None:
-        """Log info message"""
-        msg_str = str(message)
-        if len(msg_str) > 5000:
-            msg_str = truncate_text(msg_str, max_lines=50, max_chars=5000)
-        entry = LogEntry(msg_str, LogLevel.INFO, category, context if context else None)
-        self._record(entry)
+        ``tasks.py`` constructs the logger before it can capture ``self`` for
+        ``send_event``, so we need a setter.
+        """
+        self._event_emitter = emitter
 
-    def success(self, message: str, category: LogCategory = LogCategory.STATUS, **context) -> None:
-        """Log success message"""
-        entry = LogEntry(message, LogLevel.SUCCESS, category, context if context else None)
-        self._record(entry)
+    # ----- core write-path ------------------------------------------------
 
-    def warning(self, message: str, category: LogCategory = LogCategory.SYSTEM, **context) -> None:
-        """Log warning message"""
-        entry = LogEntry(message, LogLevel.WARNING, category, context if context else None)
-        self._record(entry)
+    def _record(self, entry: LogEntry, *, emit_event: bool = True) -> None:
+        self._buffer.append(entry)
+        self._console.write(entry)
+        if emit_event and self._event_emitter is not None:
+            try:
+                # Celery's EventReceiver injects its own ``timestamp``
+                # field (Unix-time float) into every event and runs
+                # arithmetic on it; if our payload also carries
+                # ``timestamp`` (as an ISO string from LogEntry.to_dict)
+                # the receiver crashes with ``TypeError: unsupported
+                # operand type(s) for -: 'str' and 'int'``. Pop it here
+                # and re-key as ``iso_timestamp`` so consumers still
+                # have the human-readable form.
+                payload = entry.to_dict()
+                if "timestamp" in payload:
+                    payload["iso_timestamp"] = payload.pop("timestamp")
+                self._event_emitter(self.LOG_EVENT_NAME, payload)
+            except Exception:  # pragma: no cover — emitter is best-effort
+                # Never let log-shipping break the deployment; just swallow
+                # and continue. The buffered transcript still has the entry.
+                pass
 
-    def error(self, message: str, category: LogCategory = LogCategory.ERROR, **context) -> None:
-        """Log error message with optional stack trace"""
-        entry = LogEntry(message, LogLevel.ERROR, category, context if context else None)
-        self._record(entry)
+    def _build(
+        self,
+        message: str,
+        /,
+        *,
+        level: LogLevel,
+        category: LogCategory,
+        max_chars: int = 5000,
+        **fields: Any,
+    ) -> LogEntry:
+        # ``message`` is positional-only (note the ``/``) so a context
+        # kwarg literally named ``message`` — e.g. a git commit message
+        # passed via ``resource_info(..., message=commit.message)`` —
+        # ends up in ``**fields`` rather than colliding with the named
+        # parameter. The kwarg is then routed into ``extra`` below.
+        cleaned = clean_text(str(message))
+        truncated = False
+        if len(cleaned) > max_chars:
+            cleaned = truncate_text(cleaned, max_lines=50, max_chars=max_chars)
+            truncated = True
+        # Slot keys are recognised dataclass fields. Anything else lands
+        # in ``extra``. ``message`` is allowed to appear as a context
+        # kwarg here without overwriting the entry's main message — it
+        # just becomes another ``extra`` entry, renamed to avoid
+        # confusion with the top-level field once serialised.
+        slot_keys = {
+            "operation",
+            "duration_ms",
+            "tool",
+            "returncode",
+            "stdout",
+            "stderr",
+            "phase",
+            "progress_pct",
+            "streaming",
+        }
+        slots: dict[str, Any] = {k: v for k, v in fields.items() if k in slot_keys and v is not None}
+        extra: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k in slot_keys:
+                continue
+            # Rename a context kwarg that collides with the top-level
+            # ``message`` slot so JSON consumers don't see two values
+            # for the same key after the dict is flattened.
+            key_out = "context_message" if k == "message" else k
+            extra[key_out] = _scalar_or_str(v)
+        return LogEntry(
+            timestamp=_now_iso(),
+            level=level,
+            category=category,
+            message=cleaned,
+            correlation_id=self.correlation_id,
+            truncated=truncated,
+            extra=extra,
+            **slots,
+        )
 
-    # ============ Structured Logging Methods ============
+    # ----- level shortcuts (kept for backwards compat) --------------------
+
+    def debug(self, message: str, category: LogCategory = LogCategory.DEBUG, **context: Any) -> None:
+        self._record(self._build(message, level=LogLevel.DEBUG, category=category, **context))
+
+    def info(self, message: str, category: LogCategory = LogCategory.SYSTEM, **context: Any) -> None:
+        self._record(self._build(message, level=LogLevel.INFO, category=category, **context))
+
+    def success(self, message: str, category: LogCategory = LogCategory.STATUS, **context: Any) -> None:
+        self._record(self._build(message, level=LogLevel.SUCCESS, category=category, **context))
+
+    def warning(self, message: str, category: LogCategory = LogCategory.SYSTEM, **context: Any) -> None:
+        self._record(self._build(message, level=LogLevel.WARNING, category=category, **context))
+
+    def error(self, message: str, category: LogCategory = LogCategory.ERROR, **context: Any) -> None:
+        self._record(self._build(message, level=LogLevel.ERROR, category=category, **context))
+
+    # ----- structured helpers --------------------------------------------
 
     def phase(self, phase_name: str) -> None:
-        """Log a major deployment phase"""
-        self.info(f"=== {phase_name.upper()} ===", category=LogCategory.PHASE)
+        """Mark a major deployment phase.
 
-    def operation_start(self, operation_name: str, **context) -> None:
-        """Mark the start of an operation (with optional timing)"""
-        if self.track_timing:
-            self._operation_stack.append((operation_name, time.time()))
-
-        self.info(f"Starting: {operation_name}", category=LogCategory.OPERATION, operation=operation_name, **context)
-
-    def operation_end(self, operation_name: str, success: bool = True, **context) -> None:
-        """Mark the end of an operation (with timing info)"""
-        duration_ms = None
-
-        if self.track_timing and self._operation_stack:
-            last_op, start_time = self._operation_stack.pop()
-            if last_op == operation_name:
-                duration_ms = (time.time() - start_time) * 1000
-
-        status = "completed" if success else "failed"
-        self.info(
-            f"{status.capitalize()}: {operation_name}",
-            category=LogCategory.OPERATION,
-            operation=operation_name,
-            duration_ms=duration_ms,
-            **context,
+        Live progress is emitted separately via ``progress()`` so the
+        listener can update the DB ``progress_pct`` column. ``phase()`` only
+        adds a transcript marker.
+        """
+        self._record(
+            self._build(
+                f"=== {phase_name.upper()} ===",
+                level=LogLevel.INFO,
+                category=LogCategory.PHASE,
+                phase=phase_name,
+            )
         )
 
-    def command_output(self, tool_name: str, output: str, returncode: int = 0, **context) -> None:
-        """Log command/tool output"""
-        if returncode != 0:
-            level = LogLevel.ERROR
-            category = LogCategory.ERROR
-        else:
-            level = LogLevel.INFO
-            category = LogCategory.OUTPUT
+    def progress(self, phase_name: str, idx: int, total: int, message: str = "") -> None:
+        """Send a progress update without buffering a per-step transcript entry.
 
-        # Truncate very long outputs
-        if len(output) > 5000:
-            output = truncate_text(output, max_lines=50, max_chars=5000)
+        The buffered transcript shouldn't grow by 11 progress markers per
+        deploy — those are noise once the run is done. We still emit the
+        Celery custom event so the listener can update the DB and the UI.
 
+        Important: do NOT put a ``timestamp`` field in the payload. Celery
+        injects one itself (as a Unix-time float) and uses it in
+        ``adjust_timestamp`` math; if we override it with an ISO string
+        the EventReceiver crashes with ``TypeError: unsupported operand
+        type(s) for -: 'str' and 'int'``. Pass the ISO time as
+        ``iso_timestamp`` if it's needed downstream.
+        """
+        pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
+        if self._event_emitter is not None:
+            try:
+                self._event_emitter(
+                    self.PROGRESS_EVENT_NAME,
+                    {
+                        "phase": phase_name,
+                        "phase_index": idx,
+                        "total_phases": total,
+                        "progress_pct": pct,
+                        "message": message,
+                        "correlation_id": self.correlation_id,
+                        "iso_timestamp": _now_iso(),
+                    },
+                )
+            except Exception:
+                pass
+
+    def operation_start(self, operation_name: str, **context: Any) -> None:
+        if self.track_timing:
+            with self._stack_lock:
+                self._operation_stack.append((operation_name, time.time()))
+        self._record(
+            self._build(
+                f"Starting: {operation_name}",
+                level=LogLevel.INFO,
+                category=LogCategory.OPERATION,
+                operation=operation_name,
+                **context,
+            )
+        )
+
+    def operation_end(self, operation_name: str, success: bool = True, **context: Any) -> None:
+        duration_ms: float | None = None
+        if self.track_timing:
+            with self._stack_lock:
+                if self._operation_stack:
+                    last_op, start_time = self._operation_stack[-1]
+                    if last_op == operation_name:
+                        self._operation_stack.pop()
+                        duration_ms = (time.time() - start_time) * 1000
+        status = "completed" if success else "failed"
+        self._record(
+            self._build(
+                f"{status.capitalize()}: {operation_name}",
+                level=LogLevel.INFO,
+                category=LogCategory.OPERATION,
+                operation=operation_name,
+                duration_ms=duration_ms,
+                **context,
+            )
+        )
+
+    def command_output(self, tool_name: str, output: str, returncode: int = 0, **context: Any) -> None:
+        """Buffer a captured command output block (post-completion).
+
+        For per-line streaming use ``tool_output_line`` instead — that one
+        emits each line as its own event without 5000-char framing.
+        """
+        level = LogLevel.ERROR if returncode != 0 else LogLevel.INFO
+        category = LogCategory.ERROR if returncode != 0 else LogCategory.OUTPUT
+        self._record(
+            self._build(
+                output,
+                level=level,
+                category=category,
+                tool=tool_name,
+                operation=tool_name,
+                returncode=returncode,
+                **context,
+            )
+        )
+
+    def tool_output_line(self, tool_name: str, line: str) -> None:
+        """One streaming line of subprocess output.
+
+        Skips the buffered transcript truncation entirely (the whole point of
+        streaming is to ship lines as they happen) and marks ``streaming=True``
+        so the frontend can render it as live tail without expecting the
+        usual operation framing.
+        """
+        cleaned = clean_text(line)
+        if not cleaned:
+            return
         entry = LogEntry(
-            output,
-            level,
-            category,
-            {"tool": tool_name, "returncode": returncode, **(context if context else {})},
-            operation=tool_name,
+            timestamp=_now_iso(),
+            level=LogLevel.INFO,
+            category=LogCategory.OUTPUT,
+            message=cleaned,
+            correlation_id=self.correlation_id,
+            tool=tool_name,
+            streaming=True,
         )
         self._record(entry)
 
-    def exception(self, message: str, exception: Exception | None = None, **context) -> None:
-        """Log exception with optional stack trace"""
-        error_context = {
-            "exception_type": type(exception).__name__ if exception else "Unknown",
-            **(context if context else {}),
-        }
+    def exception(self, message: str, exception: Exception | None = None, **context: Any) -> None:
+        """Log an exception with its real traceback.
 
-        if exception:
-            error_context["exception_message"] = str(exception)
-            # Add truncated stack trace
-            tb = traceback.format_exc()
+        Uses ``format_exception(type, exc, exc.__traceback__)`` rather than
+        ``format_exc()`` so it works outside an active ``except`` block —
+        ``format_exc()`` returned ``"NoneType: None\\n"`` in that case.
+        """
+        ctx: dict[str, Any] = dict(context)
+        if exception is not None:
+            ctx["exception_type"] = type(exception).__name__
+            ctx["exception_message"] = str(exception)
+            tb = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
             if len(tb) > 2000:
                 tb = truncate_text(tb, max_lines=30)
-            error_context["stack_trace"] = tb
+            ctx["stack_trace"] = tb
+        else:
+            ctx.setdefault("exception_type", "Unknown")
+        self._record(self._build(message, level=LogLevel.ERROR, category=LogCategory.ERROR, **ctx))
 
-        entry = LogEntry(message, LogLevel.ERROR, LogCategory.ERROR, error_context)
-        self._record(entry)
+    def resource_info(self, resource_type: str, resource_name: str, **details: Any) -> None:
+        self._record(
+            self._build(
+                f"{resource_type}: {resource_name}",
+                level=LogLevel.INFO,
+                category=LogCategory.SYSTEM,
+                resource_type=resource_type,
+                resource_name=resource_name,
+                **details,
+            )
+        )
 
-    def resource_info(self, resource_type: str, resource_name: str, **details) -> None:
-        """Log information about a resource (deployment, repo, etc.)"""
-        message = f"{resource_type}: {resource_name}"
-        context = {"resource_type": resource_type, "resource_name": resource_name, **details}
-        entry = LogEntry(message, LogLevel.INFO, LogCategory.SYSTEM, context)
-        self._record(entry)
-
-    # ============ Internal Recording ============
-
-    def _record(self, entry: LogEntry) -> None:
-        """Record log entry both to system logger and internal list"""
-        self.logs.append(entry)
-
-        # Also log to Python logger for application logs
-        log_method = {
-            LogLevel.SUCCESS: self.logger.info,
-            LogLevel.ERROR: self.logger.error,
-            LogLevel.WARNING: self.logger.warning,
-            LogLevel.DEBUG: self.logger.debug,
-            LogLevel.INFO: self.logger.info,
-        }.get(entry.level, self.logger.info)
-
-        log_method(str(entry))
-
-    # ============ Output Methods ============
+    # ----- inspection / export -------------------------------------------
 
     def get_logs_dict(self) -> list[dict[str, Any]]:
-        """Get all logs as list of dictionaries (for JSON APIs)"""
-        return [log.to_dict() for log in self.logs]
+        return [e.to_dict() for e in self._buffer.snapshot()]
 
     def get_logs_json(self, pretty: bool = True) -> str:
-        """Get all logs as JSON string"""
-        indent = 2 if pretty else None
-        return json.dumps(self.get_logs_dict(), indent=indent)
+        return json.dumps(self.get_logs_dict(), indent=2 if pretty else None)
+
+    def get_logs_text(self) -> str:
+        return "\n".join(str(e) for e in self._buffer.snapshot())
 
     def get_logs_by_category(self, category: LogCategory) -> list[dict[str, Any]]:
-        """Get logs filtered by category"""
-        return [log.to_dict() for log in self.logs if log.category == category]
+        return [e.to_dict() for e in self._buffer.snapshot() if e.category == category]
 
     def get_logs_by_level(self, level: LogLevel) -> list[dict[str, Any]]:
-        """Get logs filtered by level"""
-        return [log.to_dict() for log in self.logs if log.level == level]
+        return [e.to_dict() for e in self._buffer.snapshot() if e.level == level]
 
     def get_summary(self) -> dict[str, Any]:
-        """Get a summary of all logs"""
-        by_level = {}
-        by_category = {}
-
-        for log in self.logs:
-            # Count by level
-            level_key = log.level.value
-            by_level[level_key] = by_level.get(level_key, 0) + 1
-
-            # Count by category
-            cat_key = log.category.value
-            by_category[cat_key] = by_category.get(cat_key, 0) + 1
-
+        entries = self._buffer.snapshot()
+        by_level: dict[str, int] = {}
+        by_category: dict[str, int] = {}
+        for e in entries:
+            by_level[e.level.value] = by_level.get(e.level.value, 0) + 1
+            by_category[e.category.value] = by_category.get(e.category.value, 0) + 1
         return {
-            "total_entries": len(self.logs),
+            "total_entries": len(entries),
             "by_level": by_level,
             "by_category": by_category,
             "timestamp_range": {
-                "first": self.logs[0].timestamp if self.logs else None,
-                "last": self.logs[-1].timestamp if self.logs else None,
+                "first": entries[0].timestamp if entries else None,
+                "last": entries[-1].timestamp if entries else None,
             },
         }
 
-    def get_logs_text(self) -> str:
-        """Get all logs formatted as plain text"""
-        return "\n".join(str(log) for log in self.logs)
-
     def clear(self) -> None:
-        """Clear all logs"""
-        self.logs.clear()
-        self._operation_stack.clear()
+        self._buffer.clear()
+        with self._stack_lock:
+            self._operation_stack.clear()
 
 
-def get_logger(name: str) -> StructuredLogger:
-    """Get a structured logger instance"""
-    return StructuredLogger(name)
+# ----------------------------------------------------------------------------
+# Factory
+# ----------------------------------------------------------------------------
+
+
+def get_logger(name: str, *, correlation_id: str | None = None) -> StructuredLogger:
+    """Return a fresh ``StructuredLogger``.
+
+    Each deployment task gets its own instance — the per-task buffer is
+    state, so we deliberately don't memoise like ``logging.getLogger`` does.
+    """
+    return StructuredLogger(name, correlation_id=correlation_id)
