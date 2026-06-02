@@ -27,14 +27,6 @@ class Settings(BaseSettings):
     # Git
     GIT_ACCESS_TOKEN: str = ""
 
-    # Email (Gmail SMTP)
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
-    SMTP_USER: str = ""  # Gmail address
-    SMTP_PASSWORD: str = ""  # Gmail App Password
-    SMTP_FROM_EMAIL: str = ""  # Sender email
-    SMTP_FROM_NAME: str = "AppStore Deployment"
-
     class Config:
         env_file = ".env"
         case_sensitive = True

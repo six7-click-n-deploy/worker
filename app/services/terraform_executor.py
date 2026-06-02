@@ -1,11 +1,20 @@
 """
-Terraform execution utilities with comprehensive structured logging
+Terraform execution utilities with comprehensive structured logging.
+
+Each long-running command (init, plan, apply, destroy) streams its
+combined stdout/stderr line-by-line through an optional ``output_callback``
+so a higher-level consumer (the deploy task's per-deployment logger) can
+forward each line onto the Celery event bus while the command is still
+running. The full output is also kept in memory and returned at the end
+in the same ``(success, stdout, stderr)`` tuple as before, so existing
+callers keep working unchanged.
 """
 
 import json
 import os
 import subprocess
-from typing import Any
+import threading
+from typing import Any, Callable
 
 from ..config import settings
 from ..utils.logger import LogCategory, get_logger
@@ -27,13 +36,100 @@ def _pg_backend_override_hcl(schema_name: str) -> str:
     return "terraform {\n" '  backend "pg" {\n' f'    schema_name = "{safe}"\n' "  }\n" "}\n"
 
 
+OutputCallback = Callable[[str, str], None]
+"""Signature: ``callback(tool_name, line) -> None``.
+
+Invoked once per line read from the subprocess. ``tool_name`` lets the
+callback distinguish ``terraform_init`` / ``terraform_plan`` / ... when one
+callback is shared across operations.
+"""
+
+
+def _stream_subprocess(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: int,
+    tool_name: str,
+    output_callback: OutputCallback | None,
+) -> tuple[int, str, str]:
+    """Run a subprocess and stream its output line-by-line.
+
+    stdout and stderr are merged onto stdout (``stderr=STDOUT``) so the
+    caller and the live consumer see the lines in the order Terraform
+    intended — Terraform interleaves progress and error messages across
+    the two streams and separating them would scramble the chronology.
+    The returned tuple still exposes the merged output as ``stdout`` and
+    keeps ``stderr`` as an empty string for ABI compatibility.
+
+    A timeout is enforced via ``Popen.wait(timeout)``; on expiry the
+    process group is killed (children inherit the same group via
+    ``start_new_session``) so terraform's child providers don't survive
+    as orphans.
+    """
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,  # line-buffered — without this, output is held until
+                    # Terraform fills its 64 KiB pipe buffer
+        env=env,
+        start_new_session=True,
+    )
+    output_lines: list[str] = []
+
+    def _drain_stdout() -> None:
+        # Read in a thread so the parent can enforce a wall-clock timeout
+        # without blocking on readline.
+        try:
+            assert process.stdout is not None
+            for raw in process.stdout:
+                line = raw.rstrip("\n")
+                output_lines.append(line)
+                if output_callback is not None:
+                    try:
+                        output_callback(tool_name, line)
+                    except Exception:
+                        # Never let a flaky live-stream callback break the
+                        # actual deployment; swallow and keep draining.
+                        pass
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_drain_stdout, name=f"{tool_name}-reader", daemon=True)
+    reader.start()
+
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill the whole process group — terraform spawns provider plugins
+        # as children and a plain process.kill() would orphan them.
+        try:
+            os.killpg(process.pid, 9)
+        except (OSError, ProcessLookupError):
+            pass
+        reader.join(timeout=2)
+        return 124, "\n".join(output_lines), "Timeout"
+
+    reader.join(timeout=5)
+    return returncode, "\n".join(output_lines), ""
+
+
 class TerraformExecutor:
     """Executor for Terraform operations with detailed logging.
 
-    When `backend_conn_str` and `backend_schema_name` are provided the
-    executor configures Terraform's `pg` backend so state is persisted in
-    a remote Postgres. The conn string lives only in the per-process env
-    (`PG_CONN_STR`), never on the command line.
+    When ``backend_conn_str`` and ``backend_schema_name`` are provided the
+    executor configures Terraform's ``pg`` backend so state is persisted
+    in a remote Postgres. The conn string lives only in the per-process
+    env (``PG_CONN_STR``), never on the command line.
+
+    ``output_callback`` is optional; if set, each line of subprocess output
+    is fed to it as it arrives. The deploy task uses this to forward lines
+    onto its per-deployment logger which then ships them to the backend
+    via Celery custom events.
     """
 
     def __init__(
@@ -42,20 +138,31 @@ class TerraformExecutor:
         env_vars: dict[str, str] | None = None,
         backend_conn_str: str | None = None,
         backend_schema_name: str | None = None,
+        output_callback: OutputCallback | None = None,
     ):
         self.working_dir = working_dir
         self.terraform_path = settings.TERRAFORM_PATH
         self.env_vars = env_vars or {}
         self.backend_conn_str = backend_conn_str
         self.backend_schema_name = backend_schema_name
+        self.output_callback = output_callback
 
     def _get_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
-        """Get environment variables including OpenStack credentials and Terraform debug logging"""
+        """Get environment variables including OpenStack credentials and Terraform debug logging."""
         env = os.environ.copy()
         env.update(self.env_vars)
         if extra_env:
             env.update(extra_env)
-        env["TF_LOG"] = "DEBUG"
+        # ``TF_LOG`` is honoured by the terraform CLI and emits an enormous
+        # amount of provider/RPC trace to stderr — useful when debugging
+        # the worker itself, but it drowns the human-readable error block
+        # we forward to the user. Default to off; opt back in via
+        # ``WORKER_TF_LOG`` if you really want it.
+        tf_log = os.environ.get("WORKER_TF_LOG", "")
+        if tf_log:
+            env["TF_LOG"] = tf_log
+        else:
+            env.pop("TF_LOG", None)
         # PG_CONN_STR is read by Terraform's pg backend. Putting it in env
         # (not -backend-config="conn_str=...") keeps the password out of
         # the process listing and command logs.
@@ -64,7 +171,7 @@ class TerraformExecutor:
         return env
 
     def _write_pg_backend_override(self) -> None:
-        """Write `pg_backend_override.tf` so init configures the pg backend.
+        """Write ``pg_backend_override.tf`` so init configures the pg backend.
 
         No-op if no schema is configured (legacy local-state mode).
         """
@@ -73,73 +180,76 @@ class TerraformExecutor:
         override_path = os.path.join(self.working_dir, _PG_BACKEND_OVERRIDE_FILENAME)
         with open(override_path, "w") as f:
             f.write(_pg_backend_override_hcl(self.backend_schema_name))
-        logger.debug(f"[TF] Wrote pg backend override at {override_path} " f"(schema_name={self.backend_schema_name})")
+        logger.debug(f"[TF] Wrote pg backend override at {override_path} (schema_name={self.backend_schema_name})")
+
+    # ------------------------------------------------------------------
+    # Long-running operations (streamed)
+    # ------------------------------------------------------------------
+
+    def _run_streamed(
+        self,
+        cmd: list[str],
+        *,
+        tool_name: str,
+        timeout: int,
+    ) -> tuple[bool, str, str]:
+        logger.debug(f"[TF] Running command: {' '.join(cmd)}")
+        returncode, stdout, stderr = _stream_subprocess(
+            cmd,
+            cwd=self.working_dir,
+            env=self._get_env(),
+            timeout=timeout,
+            tool_name=tool_name,
+            output_callback=self.output_callback,
+        )
+        return returncode == 0, stdout, stderr
 
     def init(self) -> tuple[bool, str, str]:
-        """
-        Initialize Terraform in the working directory
+        """Initialize Terraform in the working directory.
+
         Returns:
-            tuple: (success, stdout, stderr)
+            tuple: (success, stdout, stderr)  — stderr merged into stdout
         """
         logger.operation_start("terraform_init", working_dir=self.working_dir)
-        logger.debug(f"[TF] Init: working_dir={self.working_dir}, terraform_path={self.terraform_path}")
         try:
             # Write the backend override BEFORE init runs. If we leave it
             # to a later step Terraform will already have committed to
-            # whatever backend the upstream module declares (or to `local`).
+            # whatever backend the upstream module declares (or to ``local``).
             self._write_pg_backend_override()
 
             cmd = [self.terraform_path, "init", "-input=false"]
-            # `-reconfigure` makes init idempotent across deploy/update/destroy
+            # ``-reconfigure`` makes init idempotent across deploy/update/destroy
             # runs on the same dir — the schema_name comes from the override
-            # file we just wrote, not from a stale `.terraform/terraform.tfstate`.
+            # file we just wrote, not from a stale ``.terraform/terraform.tfstate``.
             if self.backend_schema_name:
                 cmd.append("-reconfigure")
-            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
-            )
-            logger.debug(f"[TF] Init stdout: {result.stdout}")
-            logger.debug(f"[TF] Init stderr: {result.stderr}")
-            success = result.returncode == 0
 
-            if result.stdout:
-                logger.command_output("terraform_init", result.stdout, result.returncode)
+            success, stdout, stderr = self._run_streamed(cmd, tool_name="terraform_init", timeout=300)
+
+            if stdout:
+                logger.command_output("terraform_init", stdout, 0 if success else 1)
 
             if not success:
                 logger.error(
                     "Terraform init failed",
                     category=LogCategory.ERROR,
-                    returncode=result.returncode,
-                    stderr=result.stderr[:1000],
+                    stderr=stderr[:1000] if stderr else None,
                 )
             else:
                 logger.success("Terraform init completed", category=LogCategory.STATUS)
 
             logger.operation_end("terraform_init", success)
-            return success, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            logger.error("Terraform init timed out after 5 minutes", category=LogCategory.ERROR)
-            logger.operation_end("terraform_init", success=False)
-            return False, "", "Timeout"
+            return success, stdout, stderr
         except Exception as e:
             logger.exception("Terraform init failed with exception", exception=e)
             logger.operation_end("terraform_init", success=False)
             return False, "", str(e)
 
     def plan(self, var_file: str | None = None, variables: dict[str, Any] | None = None) -> tuple[bool, str, str]:
-        """
-        Run terraform plan
-        Args:
-            var_file: Path to tfvars file
-            variables: Dictionary of variables to pass
-        Returns:
-            tuple: (success, stdout, stderr)
-        """
+        """Run terraform plan."""
         logger.operation_start("terraform_plan", var_file=var_file, var_count=len(variables or {}))
         try:
             cmd = [self.terraform_path, "plan", "-input=false"]
-            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -149,45 +259,28 @@ class TerraformExecutor:
             logger.info("Analyzing Terraform configuration...", category=LogCategory.STATUS)
             logger.debug("plan variable keys", category=LogCategory.OPERATION, keys=list((variables or {}).keys()))
 
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=300, env=self._get_env()
-            )
-            logger.debug(f"[TF] Plan stdout: {result.stdout}")
-            logger.debug(f"[TF] Plan stderr: {result.stderr}")
-            success = result.returncode == 0
+            success, stdout, stderr = self._run_streamed(cmd, tool_name="terraform_plan", timeout=300)
 
-            if result.stdout:
-                logger.command_output("terraform_plan", result.stdout, result.returncode)
+            if stdout:
+                logger.command_output("terraform_plan", stdout, 0 if success else 1)
 
             if not success:
-                logger.error(
-                    f"Terraform plan failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
-                    category=LogCategory.ERROR,
-                    returncode=result.returncode,
-                )
+                logger.error("Terraform plan failed", category=LogCategory.ERROR)
             else:
                 logger.success("Terraform plan completed", category=LogCategory.STATUS)
 
             logger.operation_end("terraform_plan", success)
-            return success, result.stdout, result.stderr
+            return success, stdout, stderr
         except Exception as e:
             logger.exception("Terraform plan failed with exception", exception=e)
             logger.operation_end("terraform_plan", success=False)
             return False, "", str(e)
 
     def apply(self, var_file: str | None = None, variables: dict[str, Any] | None = None) -> tuple[bool, str, str]:
-        """
-        Run terraform apply
-        Args:
-            var_file: Path to tfvars file
-            variables: Dictionary of variables to pass
-        Returns:
-            tuple: (success, stdout, stderr)
-        """
+        """Run terraform apply."""
         logger.operation_start("terraform_apply", var_file=var_file, var_count=len(variables or {}))
         try:
             cmd = [self.terraform_path, "apply", "-auto-approve", "-input=false"]
-            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -196,50 +289,28 @@ class TerraformExecutor:
 
             logger.info("Applying Terraform configuration (this may take minutes)...", category=LogCategory.STATUS)
 
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=1800, env=self._get_env()
-            )
-            logger.debug(f"[TF] Apply finished: command={' '.join(cmd)}, returncode={result.returncode}")
-            logger.debug(f"[TF] Apply stdout: {result.stdout}")
-            logger.debug(f"[TF] Apply stderr: {result.stderr}")
-            success = result.returncode == 0
+            success, stdout, stderr = self._run_streamed(cmd, tool_name="terraform_apply", timeout=1800)
 
-            if result.stdout:
-                logger.command_output("terraform_apply", result.stdout, result.returncode)
+            if stdout:
+                logger.command_output("terraform_apply", stdout, 0 if success else 1)
 
             if not success:
-                logger.error(
-                    f"Terraform apply failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
-                    category=LogCategory.ERROR,
-                    returncode=result.returncode,
-                )
+                logger.error("Terraform apply failed", category=LogCategory.ERROR)
             else:
                 logger.success("Terraform apply completed successfully", category=LogCategory.STATUS)
 
             logger.operation_end("terraform_apply", success)
-            return success, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            logger.error("Terraform apply timed out after 30 minutes", category=LogCategory.ERROR)
-            logger.operation_end("terraform_apply", success=False)
-            return False, "", "Timeout"
+            return success, stdout, stderr
         except Exception as e:
             logger.exception("Terraform apply failed with exception", exception=e)
             logger.operation_end("terraform_apply", success=False)
             return False, "", str(e)
 
     def destroy(self, var_file: str | None = None, variables: dict[str, Any] | None = None) -> tuple[bool, str, str]:
-        """
-        Run terraform destroy
-        Args:
-            var_file: Path to tfvars file
-            variables: Dictionary of variables to pass
-        Returns:
-            tuple: (success, stdout, stderr)
-        """
+        """Run terraform destroy."""
         logger.operation_start("terraform_destroy", var_file=var_file, var_count=len(variables or {}))
         try:
             cmd = [self.terraform_path, "destroy", "-auto-approve", "-input=false"]
-            logger.debug(f"[TF] Running command: {' '.join(cmd)}")
             if var_file:
                 cmd.extend(["-var-file", var_file])
             if variables:
@@ -248,38 +319,30 @@ class TerraformExecutor:
 
             logger.info("Destroying Terraform resources (this may take minutes)...", category=LogCategory.STATUS)
 
-            result = subprocess.run(
-                cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=1800, env=self._get_env()
-            )
-            logger.debug(f"[TF] Destroy stdout: {result.stdout}")
-            logger.debug(f"[TF] Destroy stderr: {result.stderr}")
-            success = result.returncode == 0
+            success, stdout, stderr = self._run_streamed(cmd, tool_name="terraform_destroy", timeout=1800)
 
-            if result.stdout:
-                logger.command_output("terraform_destroy", result.stdout, result.returncode)
+            if stdout:
+                logger.command_output("terraform_destroy", stdout, 0 if success else 1)
 
             if not success:
-                logger.error("Terraform destroy failed", category=LogCategory.ERROR, returncode=result.returncode)
+                logger.error("Terraform destroy failed", category=LogCategory.ERROR)
             else:
                 logger.success("Terraform destroy completed successfully", category=LogCategory.STATUS)
 
             logger.operation_end("terraform_destroy", success)
-            return success, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            logger.error("Terraform destroy timed out after 30 minutes", category=LogCategory.ERROR)
-            logger.operation_end("terraform_destroy", success=False)
-            return False, "", "Timeout"
+            return success, stdout, stderr
         except Exception as e:
             logger.exception("Terraform destroy failed with exception", exception=e)
             logger.operation_end("terraform_destroy", success=False)
             return False, "", str(e)
 
+    # ------------------------------------------------------------------
+    # Short read-only operations (still buffered — fast, no live consumer
+    # waits on these)
+    # ------------------------------------------------------------------
+
     def output(self) -> dict[str, Any] | None:
-        """
-        Get terraform outputs as JSON
-        Returns:
-            dict: Terraform outputs or None if failed
-        """
+        """Get terraform outputs as JSON."""
         logger.operation_start("terraform_output")
         try:
             cmd = [self.terraform_path, "output", "-json"]
@@ -287,11 +350,9 @@ class TerraformExecutor:
             result = subprocess.run(
                 cmd, cwd=self.working_dir, capture_output=True, text=True, timeout=60, env=self._get_env()
             )
-            logger.debug(f"[TF] Output stdout: {result.stdout}")
-            logger.debug(f"[TF] Output stderr: {result.stderr}")
             if result.returncode != 0:
                 logger.warning(
-                    "Terraform output retrieval failed", category=LogCategory.WARNING, returncode=result.returncode
+                    "Terraform output retrieval failed", category=LogCategory.OPERATION, returncode=result.returncode
                 )
                 logger.operation_end("terraform_output", success=False)
                 return None
@@ -306,9 +367,9 @@ class TerraformExecutor:
             return None
 
     def state_pull(self) -> str | None:
-        """Return the current state JSON via `terraform state pull`.
+        """Return the current state JSON via ``terraform state pull``.
 
-        Works for both the local backend (reads `terraform.tfstate`) and
+        Works for both the local backend (reads ``terraform.tfstate``) and
         the pg backend (reads from Postgres). Used by the worker to
         snapshot state onto the task row for debugging — the canonical
         copy lives in the pg backend.
@@ -326,11 +387,11 @@ class TerraformExecutor:
             if result.returncode != 0:
                 logger.warning(
                     "Terraform state pull failed",
-                    category=LogCategory.WARNING,
+                    category=LogCategory.OPERATION,
                     returncode=result.returncode,
                 )
                 return None
             return result.stdout
         except Exception as e:
-            logger.warning(f"Terraform state pull raised: {e}", category=LogCategory.WARNING)
+            logger.warning(f"Terraform state pull raised: {e}", category=LogCategory.OPERATION)
             return None

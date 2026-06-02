@@ -35,7 +35,13 @@ class PerTaskCloudsConfig:
             terraform.run(env_vars=env)
     """
 
-    CLOUD_NAME = "deployment"
+    # Profile name written into the per-task ``clouds.yaml``. App
+    # Terraform templates reference this via ``provider "openstack" {
+    # cloud = "openstack" }`` (matching the OpenStack convention used
+    # in their docs), so changing this requires updating every
+    # template — keep it as ``"openstack"`` unless there's a strong
+    # reason to switch.
+    CLOUD_NAME = "openstack"
 
     def __init__(self, envelope: dict[str, Any], work_dir: str):
         if not isinstance(envelope, dict):
