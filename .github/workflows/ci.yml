@@ -154,6 +154,7 @@ jobs:
 
       - name: pip-audit (production deps, HIGH+)
         run: |
+          poetry run python -m pip install --upgrade pip
           poetry run python -m pip install pip-audit
           poetry run pip-audit --strict
 
