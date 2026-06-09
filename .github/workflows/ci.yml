@@ -76,11 +76,23 @@ jobs:
         run: poetry install --with dev
 
       - name: Run unit tests
-        run: poetry run pytest -m unit -v --cov=app --cov-report=xml --cov-report=term
+        run: poetry run pytest -m unit -v
         env:
           CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
+          # Suffix the .coverage file so it can be merged in the
+          # `coverage` job alongside the integration job's data.
+          COVERAGE_FILE: .coverage.unit
 
-      - name: Upload coverage
+      - name: Upload coverage data (unit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-unit
+          path: .coverage.unit
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Upload coverage XML
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -120,6 +132,102 @@ jobs:
           CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
           CELERY_BROKER_URL: "amqp://guest:guest@localhost:5672/"
           CELERY_RESULT_BACKEND: "redis://localhost:6379/0"
+          # Suffix the .coverage file so it can be merged in the
+          # `coverage` job alongside the unit job's data.
+          COVERAGE_FILE: .coverage.integration
+
+      - name: Upload coverage data (integration)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-integration
+          path: .coverage.integration
+          include-hidden-files: true
+          retention-days: 1
+
+  # ================================================================
+  # 📊 COVERAGE — aggregate + publish to GitHub Pages
+  # ================================================================
+  # Combines the .coverage data from the unit and integration jobs,
+  # renders an HTML report, emits a Shields.io endpoint badge.json,
+  # and (only on main) deploys everything to GitHub Pages.
+  #
+  # The Pages source for this repo must be set to "GitHub Actions"
+  # under Settings → Pages once. Until then, the deploy step fails
+  # but the artifact is still uploaded.
+  coverage:
+    name: "📊 Coverage"
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration]
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      - name: Combine coverage data
+        run: poetry run coverage combine
+
+      - name: Render HTML report
+        run: poetry run coverage html -d coverage-html
+
+      - name: Render JSON report
+        run: poetry run coverage json -o coverage-html/coverage.json
+
+      - name: Generate Shields.io endpoint badge
+        run: |
+          PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
+          COLOR=$(python -c "p=$PCT; print('brightgreen' if p>=80 else 'green' if p>=70 else 'yellow' if p>=50 else 'orange' if p>=30 else 'red')")
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > coverage-html/badge.json
+          echo "Coverage: ${PCT}% (${COLOR})"
+
+      - name: Upload HTML report as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html
+          retention-days: 14
+
+      - name: Configure Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: coverage-html
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/deploy-pages@v4
 
   # ================================================================
   # 🔒 SECURITY (deps + filesystem) — blocks on HIGH/CRITICAL
