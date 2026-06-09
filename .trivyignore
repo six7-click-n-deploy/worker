@@ -32,3 +32,11 @@ CVE-2026-46680
 CVE-2026-44973
 CVE-2026-45022
 
+# Terraform upstream CVE backlog — Terraform's latest stable release
+# (v1.15.5) is built against Go 1.25.9; HashiCorp hasn't yet shipped
+# a rebuild against Go 1.25.11+. Nothing to fix on our side; we bump
+# TERRAFORM_VERSION as soon as HashiCorp ships a release built against
+# Go 1.25.11 / 1.26.4 or later.
+#
+# Go stdlib (fixed in 1.25.11 / 1.26.4):
+CVE-2026-42504
