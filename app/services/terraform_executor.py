@@ -35,7 +35,7 @@ def _pg_backend_override_hcl(schema_name: str) -> str:
     # schema_name is interpolated, not user-controlled (we generate it from
     # the deployment UUID). Quoted as an HCL string literal.
     safe = schema_name.replace('"', '\\"')
-    return "terraform {\n" '  backend "pg" {\n' f'    schema_name = "{safe}"\n' "  }\n" "}\n"
+    return f'terraform {{\n  backend "pg" {{\n    schema_name = "{safe}"\n  }}\n}}\n'
 
 
 OutputCallback = Callable[[str, str], None]

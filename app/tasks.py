@@ -190,6 +190,14 @@ PHASE_TERRAFORM_APPLY = "TERRAFORM_APPLY"
 PHASE_OUTPUTS_AND_CLEANUP = "OUTPUTS_AND_CLEANUP"
 PHASE_TERRAFORM_DESTROY = "TERRAFORM_DESTROY"
 PHASE_CLEANUP = "CLEANUP"
+# Pause/resume share the deploy/destroy preamble (clone → clouds.yaml →
+# terraform init for the pg-backed state pull) but their hot phase is
+# a CLI-driven server stop/start, not a terraform apply or destroy.
+# Naming the phase distinctly so the frontend stepper renders an honest
+# label instead of reusing TERRAFORM_DESTROY for an action that doesn't
+# touch terraform at all.
+PHASE_SERVER_STOP = "SERVER_STOP"
+PHASE_SERVER_START = "SERVER_START"
 
 _PHASES_WITH_PACKER = (
     PHASE_STARTING,
@@ -225,6 +233,29 @@ _PHASES_DESTROY = (
     PHASE_CREDS_MATERIALISE,
     PHASE_TERRAFORM_INIT,
     PHASE_TERRAFORM_DESTROY,
+    PHASE_CLEANUP,
+)
+# Pause / resume share the destroy preamble — git clone at the same
+# release tag, materialise clouds.yaml, terraform init so we can pull
+# the canonical state from the pg backend. The hot phase is the
+# server stop / start loop. CLEANUP runs the repo shred and (for the
+# log) a final state pull, mirroring destroy's tail.
+_PHASES_PAUSE = (
+    PHASE_STARTING,
+    PHASE_OPENSTACK_SETUP,
+    PHASE_GIT_CLONE,
+    PHASE_CREDS_MATERIALISE,
+    PHASE_TERRAFORM_INIT,
+    PHASE_SERVER_STOP,
+    PHASE_CLEANUP,
+)
+_PHASES_RESUME = (
+    PHASE_STARTING,
+    PHASE_OPENSTACK_SETUP,
+    PHASE_GIT_CLONE,
+    PHASE_CREDS_MATERIALISE,
+    PHASE_TERRAFORM_INIT,
+    PHASE_SERVER_START,
     PHASE_CLEANUP,
 )
 
@@ -389,7 +420,7 @@ def deploy_application(
         # the git clone so the per-task clouds.yaml lives inside repo_path).
         phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
         if not openstack_envelope:
-            raise Exception("OpenStack credential envelope missing — user must upload " "credentials before deploying")
+            raise Exception("OpenStack credential envelope missing — user must upload credentials before deploying")
         task_logger.success(
             "OpenStack credential envelope received",
             category=LogCategory.STATUS,
@@ -600,6 +631,26 @@ def deploy_application(
             if teams:
                 terraform_vars["users"] = teams
             terraform_vars = encode_terraform_vars(terraform_vars)
+
+            # File-upload variables can balloon the JSON-encoded value
+            # of a single -var to several hundred KB. The Nova metadata
+            # service caps cloud-init user_data at ~64 KB compressed
+            # (~150-200 KB raw) — beyond that, the boot fails after
+            # apply with an opaque message. We can't know exactly how
+            # the app's template fans the data into user_data, but a
+            # per-variable warning at >120 KB lands the heads-up in
+            # the worker log so the cause is visible without ssh-ing
+            # into a half-broken VM.
+            _log_bytes_per_var_warn = 120 * 1024
+            for _vname, _vstr in terraform_vars.items():
+                if isinstance(_vstr, str) and len(_vstr) > _log_bytes_per_var_warn:
+                    task_logger.warning(
+                        f"Terraform variable '{_vname}' is "
+                        f"{len(_vstr) // 1024} KB encoded — close to the "
+                        "cloud-init user_data limit; the VM may fail to "
+                        "boot if the template inlines the full value.",
+                        category=LogCategory.WARNING,
+                    )
 
             task_logger.info(
                 "Terraform variable keys",
@@ -953,3 +1004,349 @@ def destroy_deployment(
                 task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
             except Exception as e:
                 task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+
+
+# ----------------------------------------------------------------
+# PAUSE / RESUME — compute-instance-only lifecycle
+# ----------------------------------------------------------------
+#
+# Both tasks share the destroy preamble (git clone at the same release
+# tag → per-task clouds.yaml → terraform init pointed at the
+# pg backend) so we can pull the canonical terraform state and read
+# back which compute instances belong to this deployment. The hot
+# phase is then a CLI-driven stop/start loop — terraform itself is
+# untouched, the state file is left as-is, and the next deploy/destroy
+# can resume from exactly the same point.
+#
+# Why state pull and not server tagging?
+#   * No app template needs to be modified — the template's existing
+#     ``openstack_compute_instance_v2`` resources are the source of
+#     truth. Tag-based discovery would require every app to set a
+#     specific tag, easy to forget.
+#   * The pg backend already holds the canonical state, so the pull
+#     is local-Postgres-fast.
+#
+# CLI idempotency means the loop can re-run on retry without us
+# tracking which servers already stopped/started.
+
+
+def _extract_compute_instance_ids(state_json: str | None) -> list[str]:
+    """Return server IDs from a terraform pg-backend state dump.
+
+    Terraform's serialised state shape is
+    ``{"resources": [{"type": "...", "instances": [{"attributes": {"id": "..."}}]}]}``.
+    Filtered to ``openstack_compute_instance_v2`` so we only stop/start
+    Nova servers, not volumes / networks / security groups.
+
+    Returns an empty list on any parsing trouble — the caller can then
+    decide whether "no servers found" is a hard error (deploy never
+    actually ran) or a no-op success (everything already torn down).
+    """
+    if not state_json:
+        return []
+    try:
+        state = json.loads(state_json) if isinstance(state_json, str) else state_json
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+    ids: list[str] = []
+    for resource in state.get("resources", []):
+        if resource.get("type") != "openstack_compute_instance_v2":
+            continue
+        for instance in resource.get("instances", []):
+            attrs = instance.get("attributes") or {}
+            sid = attrs.get("id")
+            if sid:
+                ids.append(sid)
+    return ids
+
+
+def _run_compute_lifecycle(
+    self,
+    deployment_id: str,
+    app_id: str,
+    app_git_link: str,
+    release: str,
+    user_vars: dict[str, Any],
+    teams: dict[str, list] | None,
+    openstack_envelope: dict[str, Any] | None,
+    *,
+    action: str,  # "pause" | "resume" — only for log/error labels
+    phases: tuple[str, ...],
+    server_phase: str,
+    server_op: str,  # "stop" | "start"
+):
+    """Shared body for ``pause_deployment`` / ``resume_deployment``.
+
+    Mirrors :func:`destroy_deployment`'s preamble exactly so the two
+    paths stay easy to reason about. Diverges only at the hot phase:
+    instead of ``terraform destroy``, we pull the state, extract
+    every compute instance's ID, and shell out to
+    ``openstack server stop|start`` for each.
+
+    Failures during the per-server loop are accumulated and re-raised
+    once with a list of which servers failed — so the user sees
+    "stopped 4/5; failed: web-1: locked task" instead of just "pause
+    failed" without any pointer to which instance is stuck.
+    """
+    label = f"{action}:{deployment_id}"
+    task_logger = get_logger(label, correlation_id=deployment_id)
+
+    bound_task = self
+
+    def _emit(event_name: str, payload: dict[str, Any]) -> None:
+        bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
+
+    task_logger.set_event_emitter(_emit)
+    phase_tracker = _PhaseTracker(task_logger, phases)
+
+    repo_path = None
+    terraform_dir: str | None = None
+    openstack_env: dict[str, str] = {}
+    clouds_config: PerTaskCloudsConfig | None = None
+
+    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
+    tfstate_schema = _tfstate_schema_name(deployment_id)
+
+    if teams is None:
+        teams = {}
+
+    def _stream_line(tool: str, line: str) -> None:
+        task_logger.tool_output_line(tool, line)
+
+    try:
+        phase_tracker.mark(PHASE_STARTING, f"Starting {action}")
+        task_logger.resource_info(
+            "deployment",
+            deployment_id,
+            app_id=app_id,
+            git_url=app_git_link,
+            release=release,
+            action=action,
+        )
+
+        phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
+        if not openstack_envelope:
+            raise Exception(f"OpenStack credential envelope missing — cannot {action} without credentials")
+        task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
+
+        phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
+        try:
+            repo_path = git_service.clone_release(
+                git_url=app_git_link,
+                deployment_id=deployment_id,
+                tag=release,
+            )
+            task_logger.success("Repository cloned", category=LogCategory.STATUS)
+        except Exception as e:
+            raise Exception(f"Git clone failed: {str(e)}")
+
+        phase_tracker.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
+        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
+        openstack_env = clouds_config.__enter__()
+        task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+
+        terraform_dir = os.path.join(repo_path, "terraform")
+        if not os.path.exists(terraform_dir):
+            raise Exception(f"Terraform directory not found at {terraform_dir}")
+
+        terraform = TerraformExecutor(
+            terraform_dir,
+            env_vars=openstack_env,
+            backend_conn_str=tfstate_conn_str,
+            backend_schema_name=tfstate_schema,
+            output_callback=_stream_line,
+        )
+
+        phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
+        success, stdout, stderr = terraform.init()
+        if not success:
+            if stdout:
+                task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
+            if stderr:
+                task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
+            raise Exception("Terraform init failed")
+        task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
+
+        # Pull the canonical state from the pg backend, then walk it
+        # to find every compute instance attached to this deployment.
+        # An empty list usually means the deployment never reached a
+        # successful apply — surface that as a hard error rather than
+        # a silent no-op so the user doesn't think pause "worked" on
+        # an empty deployment.
+        state_dump = terraform.state_pull()
+        server_ids = _extract_compute_instance_ids(state_dump)
+        if not server_ids:
+            raise Exception(
+                "No compute instances found in terraform state — "
+                f"nothing to {action}. The deployment may have been "
+                "torn down already or never reached a successful apply."
+            )
+        task_logger.info(
+            f"{len(server_ids)} compute instance(s) found",
+            category=LogCategory.OPERATION,
+            server_ids=server_ids,
+        )
+
+        phase_tracker.mark(
+            server_phase,
+            f"{'Stopping' if server_op == 'stop' else 'Starting'} {len(server_ids)} server(s)",
+        )
+
+        openstack_service = OpenStackService(env_vars=openstack_env)
+        op_method = openstack_service.server_stop if server_op == "stop" else openstack_service.server_start
+
+        failures: list[tuple[str, str]] = []
+        for sid in server_ids:
+            # Optional pre-flight: log the human name + power state so
+            # the per-deployment log is readable. We never fail on
+            # show() — it's purely cosmetic.
+            info = openstack_service.server_show(sid)
+            label_str = f"{info.get('name', sid)}" if info else sid
+            current = info.get("status") if info else None
+            task_logger.info(
+                f"{server_op} {label_str} (status: {current or 'unknown'})",
+                category=LogCategory.OPERATION,
+                server_id=sid,
+            )
+
+            ok, err = op_method(sid)
+            if ok:
+                task_logger.success(
+                    f"{label_str}: {server_op} OK",
+                    category=LogCategory.STATUS,
+                )
+            else:
+                task_logger.error(
+                    f"{label_str}: {server_op} failed: {err}",
+                    category=LogCategory.ERROR,
+                    server_id=sid,
+                )
+                failures.append((sid, err or "unknown error"))
+
+        if failures:
+            joined = "; ".join(f"{sid}: {err}" for sid, err in failures)
+            raise Exception(f"{action} failed for {len(failures)}/{len(server_ids)} server(s): {joined}")
+
+        phase_tracker.mark(PHASE_CLEANUP, "Pulling final state snapshot")
+        # State doesn't change for pause/resume (the resources still
+        # exist, just in a different power state), but we pull it
+        # again so the task row gets a fresh snapshot for debugging.
+        try:
+            tf_state_post = terraform.state_pull()
+        except Exception as e:
+            task_logger.warning(
+                f"Could not pull terraform state post-{action}: {e}",
+                category=LogCategory.WARNING,
+            )
+            tf_state_post = state_dump
+
+        task_logger.success(
+            f"Deployment {deployment_id} {action}d successfully",
+            category=LogCategory.STATUS,
+        )
+
+        return {
+            "status": "success",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+            "tf_state": tf_state_post,
+            "commit_info": None,
+            # Pause/resume don't generate or change terraform outputs —
+            # field is kept for event-listener parity with the deploy
+            # / destroy payload shape.
+            "terraform_outputs": {},
+        }
+
+    except Exception as e:
+        task_logger.exception(f"{action} failed: {str(e)}", exception=e, deployment_id=deployment_id)
+        raise Failure(
+            message=str(e),
+            deployment_id=deployment_id,
+            logs_dict=task_logger.get_logs_dict(),
+            tf_state=None,
+            commit_info=None,
+            terraform_outputs={},
+        )
+
+    finally:
+        if clouds_config is not None:
+            try:
+                clouds_config.__exit__(None, None, None)
+            except Exception as e:
+                task_logger.warning(
+                    f"Per-task clouds.yaml cleanup failed: {e}",
+                    category=LogCategory.WARNING,
+                )
+        if repo_path:
+            try:
+                git_service.cleanup_repository(repo_path)
+                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
+            except Exception as e:
+                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
+
+
+@celery_app.task(bind=True, name="tasks.pause_deployment")
+def pause_deployment(
+    self,
+    deployment_id: str,
+    app_id: str,
+    app_git_link: str,
+    release: str,
+    user_vars: dict[str, Any],
+    teams: dict[str, list] = None,
+    openstack_envelope: dict[str, Any] | None = None,
+):
+    """Halt a deployment by stopping all of its compute instances.
+
+    Volumes and networks are untouched, so resume restores the same
+    instances byte-for-byte. The terraform state is also untouched,
+    so a subsequent destroy proceeds normally (terraform destroy is
+    happy to tear down SHUTOFF instances).
+    """
+    return _run_compute_lifecycle(
+        self,
+        deployment_id,
+        app_id,
+        app_git_link,
+        release,
+        user_vars,
+        teams,
+        openstack_envelope,
+        action="pause",
+        phases=_PHASES_PAUSE,
+        server_phase=PHASE_SERVER_STOP,
+        server_op="stop",
+    )
+
+
+@celery_app.task(bind=True, name="tasks.resume_deployment")
+def resume_deployment(
+    self,
+    deployment_id: str,
+    app_id: str,
+    app_git_link: str,
+    release: str,
+    user_vars: dict[str, Any],
+    teams: dict[str, list] = None,
+    openstack_envelope: dict[str, Any] | None = None,
+):
+    """Resume a paused deployment by starting all of its compute instances.
+
+    Mirrors :func:`pause_deployment`'s preamble exactly so the two
+    code paths stay symmetric and easy to compare side-by-side.
+    """
+    return _run_compute_lifecycle(
+        self,
+        deployment_id,
+        app_id,
+        app_git_link,
+        release,
+        user_vars,
+        teams,
+        openstack_envelope,
+        action="resume",
+        phases=_PHASES_RESUME,
+        server_phase=PHASE_SERVER_START,
+        server_op="start",
+    )
