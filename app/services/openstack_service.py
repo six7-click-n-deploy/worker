@@ -46,7 +46,11 @@ class OpenStackService:
         env.update(self.env_vars)
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=timeout, env=env,
+                args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
             )
             return (result.returncode, result.stdout or "", result.stderr or "")
         except subprocess.TimeoutExpired:
@@ -132,7 +136,8 @@ class OpenStackService:
         no extra status check needed.
         """
         rc, _stdout, stderr = self._run(
-            ["openstack", "server", "stop", server_id], timeout=120,
+            ["openstack", "server", "stop", server_id],
+            timeout=120,
         )
         if rc == 0:
             return (True, None)
@@ -145,7 +150,8 @@ class OpenStackService:
         failure. Idempotent on already-ACTIVE instances.
         """
         rc, _stdout, stderr = self._run(
-            ["openstack", "server", "start", server_id], timeout=120,
+            ["openstack", "server", "start", server_id],
+            timeout=120,
         )
         if rc == 0:
             return (True, None)

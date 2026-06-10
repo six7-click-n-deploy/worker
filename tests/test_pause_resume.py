@@ -1,4 +1,5 @@
 """Tests for the pause/resume helpers in worker/app/tasks.py."""
+
 import json
 
 import pytest
@@ -60,7 +61,7 @@ class TestComputeInstanceExtractor:
                     "instances": [
                         {"attributes": {"id": "srv-1"}},
                         {"attributes": {}},  # malformed — skip
-                        {},                   # missing attributes — skip
+                        {},  # missing attributes — skip
                     ],
                 }
             ]
