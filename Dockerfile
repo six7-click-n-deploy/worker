@@ -37,8 +37,14 @@ ARG PACKER_VERSION=1.15.3
 
 WORKDIR /app
 
-# System Dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# System Dependencies. ``apt-get upgrade`` runs first so the base
+# ``python:3.11-slim`` tag picks up Debian-security backports released
+# after the upstream image was last rebuilt — that's where things like
+# CVE-2026-45447 (openssl 3.5.6-1~deb13u2) come from. Trivy blocks the
+# push on any HIGH/CRITICAL OS finding, so even though it enlarges the
+# layer slightly we'd rather take the bytes than burn a .trivyignore
+# line every time upstream debian releases a CVE-fix.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     git \
     wget \
     unzip \
