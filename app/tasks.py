@@ -474,11 +474,7 @@ def deploy_application(
         # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
         # silently serves stale images when the underlying commit changes. The
         # short SHA is content-addressed: a new commit always misses the cache.
-        if commit_info and commit_info.get("hash"):  # noqa: SIM108 — explicit if/else keeps the fallback comment readable
-            image_tag = commit_info["hash"][:8]
-        else:
-            # Commit lookup failed above (warning logged); fall back to release tag.
-            image_tag = release
+        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         image_name = f"{app_id}-{image_tag}"
 
         # Decide once whether this deployment needs a Packer build, and

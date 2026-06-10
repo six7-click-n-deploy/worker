@@ -32,8 +32,8 @@ FROM python:3.11-slim AS runtime
 
 # Build arguments für Multi-Platform Support
 ARG TARGETARCH
-ARG TERRAFORM_VERSION=1.14.3
-ARG PACKER_VERSION=1.14.3
+ARG TERRAFORM_VERSION=1.15.5
+ARG PACKER_VERSION=1.15.3
 
 WORKDIR /app
 
@@ -46,6 +46,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+# Upgrade base-image Python tooling (pip / setuptools / wheel) to pull
+# in security fixes that the upstream `python:3.11-slim` tag hasn't
+# picked up yet. Trivy scans these system site-packages — anything
+# HIGH/CRITICAL here blocks the push.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # OpenStack CLI installieren
 RUN pip install --no-cache-dir python-openstackclient

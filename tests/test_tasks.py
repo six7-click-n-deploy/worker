@@ -9,10 +9,9 @@ class TestTaskBasics:
 
     def test_task_import(self):
         """Test that tasks can be imported."""
-        from app.tasks import deploy_app, destroy_app
+        from app.tasks import deploy_application
 
-        assert deploy_app is not None
-        assert destroy_app is not None
+        assert deploy_application is not None
 
     def test_celery_app_import(self):
         """Test that celery app can be imported."""

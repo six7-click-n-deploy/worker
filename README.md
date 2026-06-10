@@ -1,5 +1,7 @@
 # Worker
 
+[![Coverage](https://img.shields.io/endpoint?url=https://six7-click-n-deploy.github.io/worker/badge.json)](https://six7-click-n-deploy.github.io/worker/)
+
 Python worker service that processes deployment tasks using Celery for OpenStack infrastructure.
 
 ## Features

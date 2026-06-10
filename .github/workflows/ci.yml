@@ -1,14 +1,11 @@
-name: CI/CD
+name: Worker CI/CD
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main]
+    tags: ['v*.*.*']
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
@@ -16,10 +13,10 @@ env:
 
 jobs:
   # ================================================================
-  # LINT & FORMAT CHECK
+  # 🔍 LINT
   # ================================================================
   lint:
-    name: Lint & Format Check
+    name: "🔍 Lint"
     runs-on: ubuntu-latest
 
     steps:
@@ -40,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: poetry install --with dev
 
-      - name: Run Ruff (Linter)
+      - name: Run Ruff
         run: poetry run ruff check .
 
       - name: Check Black formatting
@@ -49,30 +46,25 @@ jobs:
       - name: Check isort formatting
         run: poetry run isort --check-only .
 
-      - name: Run MyPy (Type checking)
+      - name: Run MyPy
         run: poetry run mypy app/ --ignore-missing-imports
-        continue-on-error: true  # Don't fail on type errors initially
+        continue-on-error: true
 
   # ================================================================
-  # TESTS
+  # 🧪 TEST (unit) — no external dependencies
   # ================================================================
-  test:
-    name: Run Tests
+  test-unit:
+    name: "🧪 Test (unit)"
     runs-on: ubuntu-latest
-    needs: lint
-
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.11']
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install Poetry
@@ -84,41 +76,251 @@ jobs:
         run: poetry install --with dev
 
       - name: Run unit tests
-        run: poetry run pytest -v -m "unit or not integration" --cov=app --cov-report=xml --cov-report=term
+        run: poetry run pytest -m unit -v
+        env:
+          CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
+          # Suffix the .coverage file so it can be merged in the
+          # `coverage` job alongside the integration job's data.
+          COVERAGE_FILE: .coverage.unit
 
-      - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.11'
-        uses: codecov/codecov-action@v3
+      - name: Upload coverage data (unit)
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          files: ./coverage.xml
-          flags: worker
+          name: coverage-data-unit
+          path: .coverage.unit
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
           name: worker-coverage
+          path: coverage.xml
+          retention-days: 7
 
   # ================================================================
-  # BUILD DOCKER IMAGE
+  # 🧪 TEST (integration) — requires external services
   # ================================================================
-  build:
-    name: Build Docker Image
+  test-integration:
+    name: "🧪 Test (integration)"
     runs-on: ubuntu-latest
-    needs: test
-    permissions:
-      contents: read
-      packages: write
+    needs: [test-unit]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Run integration tests
+        run: poetry run pytest -m integration -v || [ $? -eq 5 ]
+        env:
+          CREDENTIAL_ENCRYPTION_KEY: "Q1PNlFd4It9oQPtjCcXcmB7wGDkY4w8KwpIRNSF4u7U="
+          CELERY_BROKER_URL: "amqp://guest:guest@localhost:5672/"
+          CELERY_RESULT_BACKEND: "redis://localhost:6379/0"
+          # Suffix the .coverage file so it can be merged in the
+          # `coverage` job alongside the unit job's data.
+          COVERAGE_FILE: .coverage.integration
+
+      - name: Upload coverage data (integration)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data-integration
+          path: .coverage.integration
+          include-hidden-files: true
+          retention-days: 1
+
+  # ================================================================
+  # 📊 COVERAGE — aggregate + publish to GitHub Pages
+  # ================================================================
+  # Combines the .coverage data from the unit and integration jobs,
+  # renders an HTML report, emits a Shields.io endpoint badge.json,
+  # and (only on main) deploys everything to GitHub Pages.
+  #
+  # The Pages source for this repo must be set to "GitHub Actions"
+  # under Settings → Pages once. Until then, the deploy step fails
+  # but the artifact is still uploaded.
+  coverage:
+    name: "📊 Coverage"
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration]
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      - name: Combine coverage data
+        run: poetry run coverage combine
+
+      - name: Render HTML report
+        run: poetry run coverage html -d coverage-html
+
+      - name: Render JSON report
+        run: poetry run coverage json -o coverage-html/coverage.json
+
+      - name: Generate Shields.io endpoint badge
+        run: |
+          PCT=$(python -c "import json; print(round(json.load(open('coverage-html/coverage.json'))['totals']['percent_covered'], 1))")
+          COLOR=$(python -c "p=$PCT; print('brightgreen' if p>=80 else 'green' if p>=70 else 'yellow' if p>=50 else 'orange' if p>=30 else 'red')")
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$PCT" "$COLOR" > coverage-html/badge.json
+          echo "Coverage: ${PCT}% (${COLOR})"
+
+      - name: Upload HTML report as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html
+          retention-days: 14
+
+      - name: Configure Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: coverage-html
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/deploy-pages@v4
+
+  # ================================================================
+  # 🔒 SECURITY (deps + filesystem) — blocks on HIGH/CRITICAL
+  # ================================================================
+  # Runs in parallel with lint/test-unit. Findings appear in the
+  # GitHub Security tab via SARIF upload. Whitelist false positives
+  # in `.trivyignore` (with a comment explaining why).
+  security:
+    name: "🔒 Security"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies (production only)
+        run: poetry install --no-root --without dev
+
+      - name: pip-audit (production deps, HIGH+)
+        run: |
+          poetry run python -m pip install --upgrade pip
+          poetry run python -m pip install pip-audit
+          poetry run pip-audit --strict
+
+      # Trivy fs runs twice on purpose:
+      #   1. blocking gate — fails the job on HIGH/CRITICAL
+      #   2. SARIF emit — uploads ALL findings (incl. ignored ones)
+      #      to the Security tab so they remain visible
+      - name: Trivy filesystem scan (gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: 1
+
+      - name: Trivy filesystem scan (SARIF for Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-fs.sarif
+
+      - name: Upload Trivy fs results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # ================================================================
+  # 🐳 BUILD — always runs, proves Dockerfile works
+  # ================================================================
+  build:
+    name: "🐳 Build"
+    runs-on: ubuntu-latest
+    needs: [lint, test-integration, security]
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -126,12 +328,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build Docker image
         uses: docker/build-push-action@v5
@@ -139,46 +339,93 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/worker-image.tar
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: worker-image
-          path: /tmp/worker-image.tar
-          retention-days: 1
 
   # ================================================================
-  # PUSH DOCKER IMAGE (Only on merge to main)
+  # 🔒 IMAGE SCAN — Trivy CVE scan against the built image
   # ================================================================
-  push:
-    name: Push Docker Image
+  # Builds a single-platform amd64 image with --load so the local
+  # Docker daemon can hand it to Trivy. The build cache is shared
+  # with the multi-platform `build` job (cache-from: type=gha) so
+  # this is mostly a thin layer on top.
+  image-scan:
+    name: "🔒 Image Scan"
     runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build]
     permissions:
       contents: read
-      packages: write
+      security-events: write
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - name: Build local image (amd64, --load)
+        uses: docker/build-push-action@v5
         with:
-          name: worker-image
-          path: /tmp
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: worker:scan
+          cache-from: type=gha
 
-      - name: Load image
-        run: docker load --input /tmp/worker-image.tar
+      - name: Trivy image scan (gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: worker:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: 1
+
+      - name: Trivy image scan (SARIF for Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: worker:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-image.sarif
+
+      - name: Upload Trivy image results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+  # ================================================================
+  # 📦 PUSH — only on main
+  # ================================================================
+  push:
+    name: "📦 Push"
+    runs-on: ubuntu-latest
+    needs: [build, image-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -193,22 +440,37 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Push Docker image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Image digest
-        run: echo "Image pushed with tags - ${{ steps.meta.outputs.tags }}"
+  # ================================================================
+  # 🚀 TRIGGER STAGING DEPLOY
+  # ================================================================
+  trigger-staging:
+    name: "🚀 Trigger Staging Deploy"
+    runs-on: ubuntu-latest
+    needs: [push]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Trigger staging deployment
+        run: |
+          gh workflow run staging-deploy.yml \
+            --repo six7-click-n-deploy/deployment \
+            --ref main
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOYMENT_PAT }}
