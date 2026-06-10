@@ -10,6 +10,7 @@ in the same ``(success, stdout, stderr)`` tuple as before, so existing
 callers keep working unchanged.
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -34,7 +35,7 @@ def _pg_backend_override_hcl(schema_name: str) -> str:
     # schema_name is interpolated, not user-controlled (we generate it from
     # the deployment UUID). Quoted as an HCL string literal.
     safe = schema_name.replace('"', '\\"')
-    return "terraform {\n" '  backend "pg" {\n' f'    schema_name = "{safe}"\n' "  }\n" "}\n"
+    return f'terraform {{\n  backend "pg" {{\n    schema_name = "{safe}"\n  }}\n}}\n'
 
 
 OutputCallback = Callable[[str, str], None]
@@ -91,12 +92,10 @@ def _stream_subprocess(
                 line = raw.rstrip("\n")
                 output_lines.append(line)
                 if output_callback is not None:
-                    try:
-                        output_callback(tool_name, line)
-                    except Exception:
+                    with contextlib.suppress(Exception):
                         # Never let a flaky live-stream callback break the
                         # actual deployment; swallow and keep draining.
-                        pass
+                        output_callback(tool_name, line)
         except Exception:
             pass
 
@@ -108,10 +107,8 @@ def _stream_subprocess(
     except subprocess.TimeoutExpired:
         # Kill the whole process group — terraform spawns provider plugins
         # as children and a plain process.kill() would orphan them.
-        try:
+        with contextlib.suppress(OSError, ProcessLookupError):
             os.killpg(process.pid, 9)
-        except (OSError, ProcessLookupError):
-            pass
         reader.join(timeout=2)
         return 124, "\n".join(output_lines), "Timeout"
 

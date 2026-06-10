@@ -420,7 +420,7 @@ def deploy_application(
         # the git clone so the per-task clouds.yaml lives inside repo_path).
         phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
         if not openstack_envelope:
-            raise Exception("OpenStack credential envelope missing — user must upload " "credentials before deploying")
+            raise Exception("OpenStack credential envelope missing — user must upload credentials before deploying")
         task_logger.success(
             "OpenStack credential envelope received",
             category=LogCategory.STATUS,
@@ -474,7 +474,7 @@ def deploy_application(
         # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
         # silently serves stale images when the underlying commit changes. The
         # short SHA is content-addressed: a new commit always misses the cache.
-        if commit_info and commit_info.get("hash"):
+        if commit_info and commit_info.get("hash"):  # noqa: SIM108 — explicit if/else keeps the fallback comment readable
             image_tag = commit_info["hash"][:8]
         else:
             # Commit lookup failed above (warning logged); fall back to release tag.
@@ -645,9 +645,9 @@ def deploy_application(
             # per-variable warning at >120 KB lands the heads-up in
             # the worker log so the cause is visible without ssh-ing
             # into a half-broken VM.
-            _LOG_BYTES_PER_VAR_WARN = 120 * 1024
+            _log_bytes_per_var_warn = 120 * 1024
             for _vname, _vstr in terraform_vars.items():
-                if isinstance(_vstr, str) and len(_vstr) > _LOG_BYTES_PER_VAR_WARN:
+                if isinstance(_vstr, str) and len(_vstr) > _log_bytes_per_var_warn:
                     task_logger.warning(
                         f"Terraform variable '{_vname}' is "
                         f"{len(_vstr) // 1024} KB encoded — close to the "
@@ -920,10 +920,7 @@ def destroy_deployment(
         # Glance still has the image, even if we won't be using it; the
         # variable just has to be a non-empty string that satisfies the
         # HCL declaration.
-        if commit_info and commit_info.get("hash"):
-            image_tag = commit_info["hash"][:8]
-        else:
-            image_tag = release
+        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         image_name = f"{app_id}-{image_tag}"
 
         terraform_dir = os.path.join(repo_path, "terraform")
@@ -1078,10 +1075,10 @@ def _run_compute_lifecycle(
     teams: dict[str, list] | None,
     openstack_envelope: dict[str, Any] | None,
     *,
-    action: str,           # "pause" | "resume" — only for log/error labels
+    action: str,  # "pause" | "resume" — only for log/error labels
     phases: tuple[str, ...],
     server_phase: str,
-    server_op: str,        # "stop" | "start"
+    server_op: str,  # "stop" | "start"
 ):
     """Shared body for ``pause_deployment`` / ``resume_deployment``.
 
@@ -1134,15 +1131,15 @@ def _run_compute_lifecycle(
 
         phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
         if not openstack_envelope:
-            raise Exception(
-                f"OpenStack credential envelope missing — cannot {action} without credentials"
-            )
+            raise Exception(f"OpenStack credential envelope missing — cannot {action} without credentials")
         task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
 
         phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
         try:
             repo_path = git_service.clone_release(
-                git_url=app_git_link, deployment_id=deployment_id, tag=release,
+                git_url=app_git_link,
+                deployment_id=deployment_id,
+                tag=release,
             )
             task_logger.success("Repository cloned", category=LogCategory.STATUS)
         except Exception as e:
@@ -1201,9 +1198,7 @@ def _run_compute_lifecycle(
         )
 
         openstack_service = OpenStackService(env_vars=openstack_env)
-        op_method = (
-            openstack_service.server_stop if server_op == "stop" else openstack_service.server_start
-        )
+        op_method = openstack_service.server_stop if server_op == "stop" else openstack_service.server_start
 
         failures: list[tuple[str, str]] = []
         for sid in server_ids:
@@ -1222,7 +1217,8 @@ def _run_compute_lifecycle(
             ok, err = op_method(sid)
             if ok:
                 task_logger.success(
-                    f"{label_str}: {server_op} OK", category=LogCategory.STATUS,
+                    f"{label_str}: {server_op} OK",
+                    category=LogCategory.STATUS,
                 )
             else:
                 task_logger.error(
@@ -1234,9 +1230,7 @@ def _run_compute_lifecycle(
 
         if failures:
             joined = "; ".join(f"{sid}: {err}" for sid, err in failures)
-            raise Exception(
-                f"{action} failed for {len(failures)}/{len(server_ids)} server(s): {joined}"
-            )
+            raise Exception(f"{action} failed for {len(failures)}/{len(server_ids)} server(s): {joined}")
 
         phase_tracker.mark(PHASE_CLEANUP, "Pulling final state snapshot")
         # State doesn't change for pause/resume (the resources still

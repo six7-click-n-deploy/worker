@@ -20,6 +20,7 @@ thread also writes phase markers, so buffer access goes through an ``RLock``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 # ----------------------------------------------------------------------------
@@ -38,7 +39,7 @@ from typing import Any
 # ----------------------------------------------------------------------------
 
 
-class LogLevel(str, Enum):
+class LogLevel(StrEnum):
     DEBUG = "DEBUG"
     INFO = "INFO"
     SUCCESS = "SUCCESS"
@@ -46,7 +47,7 @@ class LogLevel(str, Enum):
     ERROR = "ERROR"
 
 
-class LogCategory(str, Enum):
+class LogCategory(StrEnum):
     PHASE = "phase"
     OPERATION = "operation"
     SYSTEM = "system"
@@ -441,7 +442,7 @@ class StructuredLogger:
         """
         pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
         if self._event_emitter is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._event_emitter(
                     self.PROGRESS_EVENT_NAME,
                     {
@@ -454,8 +455,6 @@ class StructuredLogger:
                         "iso_timestamp": _now_iso(),
                     },
                 )
-            except Exception:
-                pass
 
     def operation_start(self, operation_name: str, **context: Any) -> None:
         if self.track_timing:
