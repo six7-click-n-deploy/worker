@@ -31,7 +31,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 # ----------------------------------------------------------------------------
@@ -39,7 +39,7 @@ from typing import Any
 # ----------------------------------------------------------------------------
 
 
-class LogLevel(str, Enum):
+class LogLevel(StrEnum):
     DEBUG = "DEBUG"
     INFO = "INFO"
     SUCCESS = "SUCCESS"
@@ -47,7 +47,7 @@ class LogLevel(str, Enum):
     ERROR = "ERROR"
 
 
-class LogCategory(str, Enum):
+class LogCategory(StrEnum):
     PHASE = "phase"
     OPERATION = "operation"
     SYSTEM = "system"
