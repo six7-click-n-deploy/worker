@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any
 
 from .celery_app import celery_app
@@ -131,11 +132,14 @@ def _looks_like_file_var_value(value: Any) -> bool:
     otherwise block the cleanup with the same schema error that
     killed the deploy.
 
-    No legacy-shape compatibility — rows from the earlier wrapped
-    format have to be cleaned up by hand (operator removes the
-    deployment row + tfstate schema). Keeping the detector strict
-    keeps the surface tight and makes future refactors easier to
-    reason about.
+    Strict signature: a slot must carry ``content_b64`` to qualify
+    as a file-var. Rows that survived an earlier
+    response-side-strip-then-persisted accident (metadata triplet
+    only, no bytes) are NOT auto-stripped here — they need a hand
+    cleanup. The strictness is intentional: a too-lenient detector
+    would silently drop legitimate non-file map variables that
+    happen to share the metadata keys, and the project decided to
+    only support the freshly-persisted contract going forward.
     """
     if not isinstance(value, dict) or not value:
         return False
@@ -157,6 +161,33 @@ def _strip_file_vars(terraform_vars: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in terraform_vars.items() if not _looks_like_file_var_value(v)}
 
 
+def _scrub_nested_nones(value: Any) -> Any:
+    """Recursively drop ``None`` entries from nested dicts/lists.
+
+    ``encode_terraform_vars`` historically only filtered ``None`` at the
+    top level, which left nested ``null`` values inside dicts/lists to
+    surface as literal HCL ``null`` after the JSON round-trip. That
+    works for variables whose HCL declaration allows ``null``, but
+    misbehaves when a buggy default (see Bug #7) or an upstream slot
+    value carries a stray ``None`` inside a ``map(list(string))`` slot
+    — Terraform then rejects the value with a type-mismatch error.
+
+    Defensive cleaner: dicts have their ``None``-valued keys removed,
+    lists have their ``None`` entries filtered out, and both are walked
+    recursively. Scalars (including bools) pass through untouched.
+    """
+    if isinstance(value, dict):
+        cleaned: dict[Any, Any] = {}
+        for k, v in value.items():
+            if v is None:
+                continue
+            cleaned[k] = _scrub_nested_nones(v)
+        return cleaned
+    if isinstance(value, list):
+        return [_scrub_nested_nones(item) for item in value if item is not None]
+    return value
+
+
 def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
     """Encode variables for ``terraform -var key=value`` CLI args.
 
@@ -164,6 +195,10 @@ def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
     valid JSON literal. We JSON-encode dicts/lists once and pass them
     through verbatim — no string normalisation that could damage escape
     sequences.
+
+    Nested ``None`` values are scrubbed recursively (see
+    :func:`_scrub_nested_nones`) so a stray ``null`` deep inside a
+    ``map(list(string))`` slot can't trip Terraform's type check.
     """
     result: dict[str, str] = {}
     for k, v in d.items():
@@ -173,7 +208,7 @@ def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
             # HCL accepts lowercase only; ``str(True)`` would emit "True".
             result[k] = "true" if v else "false"
         elif isinstance(v, (dict, list)):
-            result[k] = json.dumps(v, ensure_ascii=False)
+            result[k] = json.dumps(_scrub_nested_nones(v), ensure_ascii=False)
         else:
             result[k] = str(v)
     return result
@@ -182,20 +217,34 @@ def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
 def encode_packer_vars(d: dict[str, Any]) -> dict[str, str]:
     """Encode variables for ``packer -var key=value`` CLI args.
 
-    Mirrors the historical Packer behaviour: lists are joined as
-    comma-separated strings (the project's Packer templates split them
-    again internally). The destructive backslash-stripping the old helper
-    performed is dropped — string values are passed through verbatim.
+    For HCL ``list(...)``-typed variables, we emit a JSON array literal
+    (e.g. ``["NAT"]``) — that's the only form Packer accepts via ``-var``
+    for typed-list variables. The historical comma-joined form (``NAT``
+    for ``["NAT"]``) would be reinterpreted by Packer as an unquoted
+    identifier reference (→ "Variables may not be used here"), because
+    Packer parses each ``-var`` value as an HCL expression against the
+    declared type. JSON arrays happen to be valid HCL list literals, so
+    a single representation covers both syntaxes.
+
+    Earlier templates that declared list-y arguments as plain ``string``
+    and split them internally were migrated to typed ``list(string)`` in
+    v1.0.15 — there is no longer a code path that expects comma-joining.
+    The destructive backslash-stripping the old helper performed is
+    dropped; string values are passed through verbatim.
     """
     result: dict[str, str] = {}
     for k, v in d.items():
         if v is None:
             continue
         if isinstance(v, list):
-            result[k] = ",".join(str(x) for x in v if x is not None)
+            # JSON array works for ``list(string)``, ``list(number)`` etc.
+            # ``ensure_ascii=False`` lets non-ASCII names pass through
+            # unchanged (Packer's HCL parser is UTF-8 native).
+            result[k] = json.dumps(v, ensure_ascii=False)
         elif isinstance(v, dict):
-            # No Packer template currently expects nested objects; JSON-encode
-            # defensively so a future template that does parse them works.
+            # ``map(...)``-typed Packer vars take the same JSON literal
+            # path. No Packer template in the project uses this today,
+            # but the encoding is correct for when one shows up.
             result[k] = json.dumps(v, ensure_ascii=False)
         elif isinstance(v, bool):
             result[k] = "true" if v else "false"
@@ -274,6 +323,20 @@ _PHASES_DESTROY = (
     PHASE_CREDS_MATERIALISE,
     PHASE_TERRAFORM_INIT,
     PHASE_TERRAFORM_DESTROY,
+    PHASE_CLEANUP,
+)
+# Per-VM redeploy reuses the destroy preamble (git clone at the same
+# release tag, materialise clouds.yaml, terraform init) and then runs
+# ``terraform apply -replace=<addr> -target=<addr>`` instead of
+# ``destroy``. The shape mirrors destroy exactly so the SSE phase bar
+# in the UI stays familiar.
+_PHASES_REDEPLOY = (
+    PHASE_STARTING,
+    PHASE_OPENSTACK_SETUP,
+    PHASE_GIT_CLONE,
+    PHASE_CREDS_MATERIALISE,
+    PHASE_TERRAFORM_INIT,
+    PHASE_TERRAFORM_APPLY,
     PHASE_CLEANUP,
 )
 # Pause / resume share the destroy preamble — git clone at the same
@@ -1413,3 +1476,456 @@ def resume_deployment(
         server_phase=PHASE_SERVER_START,
         server_op="start",
     )
+
+
+# ----------------------------------------------------------------
+# REDEPLOY ONE RESOURCE
+# ----------------------------------------------------------------
+#
+# Replace exactly one compute instance via
+# ``terraform apply -replace=<addr> -target=<addr>``. Everything else
+# in the deployment stays untouched — the rest of the team VMs keep
+# running, networks/SGs/FIPs persist. Conceptually a destroy+create
+# of a single resource, surfaced to the user as a "Redeploy" button.
+#
+# Trust model:
+#   * The address must already exist in the cached TF state — the
+#     backend enforces this BEFORE dispatch (see
+#     ``redeploy_deployment_resource`` in
+#     ``backend/app/routers/deployments.py``), but we double-check
+#     the address shape here as defense in depth. Two CLI flags
+#     (``-target`` / ``-replace``) take the address verbatim; subprocess
+#     argv isolation means the shell can't interpret meta-characters,
+#     but a malformed address would still confuse terraform itself.
+#   * Same per-task clouds.yaml + pg backend schema as deploy/destroy,
+#     so the apply sees the same state file.
+
+_REDEPLOY_ADDRESS_RE = re.compile(
+    r"""^
+    [A-Za-z_][A-Za-z0-9_]*
+    \.[A-Za-z_][A-Za-z0-9_-]*
+    (?:\[(?:\d+|"[^"\\]+")\])?
+    $""",
+    re.VERBOSE,
+)
+
+
+def _build_current_roster(teams: dict[str, list]) -> tuple[set[str], set[str]]:
+    """Compute the legal slot-key sets for the current roster.
+
+    Returns a ``(team_keys, user_keys)`` tuple:
+
+    * ``team_keys`` — every team name currently present. These are the
+      valid slot keys for ``var_scope=team``.
+    * ``user_keys`` — composite ``"<team>-<email>"`` keys for every
+      user currently rostered to a team. These are the valid slot keys
+      for ``var_scope=user``.
+
+    Roster entries can either be plain strings (email addresses) or
+    dicts with an ``email`` key — matches the shape the backend ships
+    in ``teams`` (see ``_attach_files_to_user_input``). Anything else is
+    skipped defensively.
+    """
+    team_keys: set[str] = set()
+    user_keys: set[str] = set()
+    for team_name, members in (teams or {}).items():
+        if not team_name:
+            continue
+        team_keys.add(team_name)
+        if not isinstance(members, list):
+            continue
+        for member in members:
+            email = member if isinstance(member, str) else (
+                member.get("email") if isinstance(member, dict) else None
+            )
+            if not email:
+                continue
+            user_keys.add(f"{team_name}-{email}")
+    return team_keys, user_keys
+
+
+def _reconcile_scoped_vars_to_roster(
+    terraform_vars: dict[str, Any],
+    teams: dict[str, list],
+    task_logger: Any,
+) -> dict[str, Any]:
+    """Drop scoped-map entries whose slot keys no longer match the roster.
+
+    Redeploy replays the originally-persisted ``user_vars["terraform"]``
+    blob, but the team/user roster may have shifted since the initial
+    deploy (members added or removed, teams renamed). A scoped variable
+    keyed on the old roster would then ship Terraform a map containing
+    orphan keys — at best a noisy diff, at worst a type/required
+    failure that blocks the replace.
+
+    Heuristic: a value is considered scoped when it's a non-empty
+    ``dict`` whose keys form a subset of either the team-name roster
+    (``var_scope=team``) or the ``<team>-<user>`` composite roster
+    (``var_scope=user``). On match we intersect the value's keys with
+    the current roster and drop the orphans. Maps that don't match the
+    heuristic — e.g. file-shape vars or the ``users`` injection — are
+    left untouched. Every drop is announced in the task log so the
+    operator sees which slots were retired.
+
+    A value that becomes empty after intersection is dropped from the
+    var-set entirely; Terraform validation handles the
+    missing-required case from there (it can pick up a declared
+    default or surface the required-but-missing error properly).
+    """
+    if not terraform_vars:
+        return terraform_vars
+
+    team_keys, user_keys = _build_current_roster(teams)
+    if not team_keys and not user_keys:
+        # Nothing rostered — can't reconcile, leave the var-set alone.
+        return terraform_vars
+
+    reconciled: dict[str, Any] = {}
+    for name, value in terraform_vars.items():
+        # Only dict-shaped, non-empty values can be scoped maps. Skip
+        # the ``users`` injection — we set that ourselves from ``teams``
+        # right after this and it's not an app-defined scoped var.
+        if name == "users" or not isinstance(value, dict) or not value:
+            reconciled[name] = value
+            continue
+        # File-shape values (see ``_looks_like_file_var_value``) are
+        # already keyed by slot but use a different content contract;
+        # let the regular file-strip handle them.
+        if _looks_like_file_var_value(value):
+            reconciled[name] = value
+            continue
+
+        slot_keys = set(value.keys())
+        # Pick the roster axis whose universe best matches the slot
+        # keys. Subset wins outright; otherwise pick the axis with the
+        # larger overlap so a partially-stale map still gets cleaned.
+        team_overlap = slot_keys & team_keys
+        user_overlap = slot_keys & user_keys
+        if slot_keys <= team_keys and team_keys:
+            allowed = team_keys
+        elif slot_keys <= user_keys and user_keys:
+            allowed = user_keys
+        elif len(user_overlap) >= len(team_overlap) and user_overlap:
+            allowed = user_keys
+        elif team_overlap:
+            allowed = team_keys
+        else:
+            # No overlap with either roster axis — leave the value
+            # alone. Probably a non-scoped map(string,...) variable
+            # the user explicitly populated.
+            reconciled[name] = value
+            continue
+
+        kept = {k: v for k, v in value.items() if k in allowed}
+        dropped = sorted(slot_keys - allowed)
+        if dropped:
+            task_logger.warning(
+                f"Redeploy roster reconciliation: dropped {len(dropped)} "
+                f"orphan slot(s) from variable '{name}': {dropped}",
+                category=LogCategory.WARNING,
+                variable=name,
+                dropped_slots=dropped,
+            )
+        if kept:
+            reconciled[name] = kept
+        else:
+            # All slots orphaned — drop the var entirely so terraform
+            # validation can fall back to the declared default (if any)
+            # or surface a proper required-but-missing error.
+            task_logger.warning(
+                f"Redeploy roster reconciliation: variable '{name}' has "
+                "no surviving slots after roster intersection — falling "
+                "back to its declared default (or required-but-missing).",
+                category=LogCategory.WARNING,
+                variable=name,
+            )
+    return reconciled
+
+
+@celery_app.task(bind=True, name="tasks.redeploy_resource")
+def redeploy_resource(
+    self,
+    deployment_id: str,
+    app_id: str,
+    app_git_link: str,
+    release: str,
+    user_vars: dict[str, Any],
+    teams: dict[str, list] = None,
+    openstack_envelope: dict[str, Any] | None = None,
+    resource_address: str | None = None,
+):
+    """Replace ONE compute instance via ``-target`` + ``-replace``.
+
+    Args mirror ``deploy_application`` so the backend's
+    ``_dispatch_lifecycle_task`` can ship the same persisted state.
+    The extra ``resource_address`` carries the Terraform state address
+    (e.g. ``openstack_compute_instance_v2.team_ide["Team-A"]``) the
+    user clicked.
+
+    Returns the same payload shape as deploy/destroy so the celery
+    event listener stays generic.
+    """
+    task_logger = get_logger(f"redeploy:{deployment_id}", correlation_id=deployment_id)
+
+    bound_task = self
+
+    def _emit(event_name: str, payload: dict[str, Any]) -> None:
+        bound_task.send_event(event_name, deployment_id=deployment_id, **payload)
+
+    task_logger.set_event_emitter(_emit)
+    phase_tracker = _PhaseTracker(task_logger, _PHASES_REDEPLOY)
+
+    repo_path: str | None = None
+    tf_state: str | None = None
+    outputs: dict[str, Any] | None = None
+    commit_info: dict[str, Any] | None = None
+    terraform_dir: str | None = None
+    openstack_env: dict[str, str] = {}
+    clouds_config: PerTaskCloudsConfig | None = None
+
+    tfstate_conn_str = settings.TFSTATE_DATABASE_URL or None
+    tfstate_schema = _tfstate_schema_name(deployment_id)
+
+    if teams is None:
+        teams = {}
+
+    def _stream_line(tool: str, line: str) -> None:
+        task_logger.tool_output_line(tool, line)
+
+    def collect_terraform_state():
+        """Snapshot the post-apply state for the task row.
+
+        Same shape as the deploy/destroy snapshot. We re-run the pull
+        from the pg backend so the row reflects what terraform thinks
+        is canonical, not what was true at the start of the task.
+        """
+        if not (terraform_dir and os.path.exists(terraform_dir)):
+            return None
+        try:
+            terraform = TerraformExecutor(
+                terraform_dir,
+                env_vars=openstack_env,
+                backend_conn_str=tfstate_conn_str,
+                backend_schema_name=tfstate_schema,
+            )
+            return terraform.state_pull()
+        except Exception as e:
+            task_logger.warning(f"Could not pull terraform state: {e}", category=LogCategory.WARNING)
+            return None
+
+    def collect_terraform_outputs():
+        if terraform_dir and os.path.exists(terraform_dir):
+            try:
+                terraform = TerraformExecutor(
+                    terraform_dir,
+                    env_vars=openstack_env,
+                    backend_conn_str=tfstate_conn_str,
+                    backend_schema_name=tfstate_schema,
+                )
+                return terraform.output()
+            except Exception as e:
+                task_logger.warning(f"Could not read terraform outputs: {e}", category=LogCategory.WARNING)
+        return None
+
+    try:
+        # Validate the address shape before we do any work. Backend
+        # already whitelisted the address against the cached state, but
+        # we double-check the shape so an empty / malformed string from
+        # a misconfigured caller doesn't reach the CLI.
+        if not resource_address or not _REDEPLOY_ADDRESS_RE.match(resource_address):
+            raise Exception(
+                f"redeploy_resource called with invalid resource_address: "
+                f"{resource_address!r}"
+            )
+
+        phase_tracker.mark(PHASE_STARTING, f"Starting redeploy of {resource_address}")
+        task_logger.resource_info(
+            "deployment",
+            deployment_id,
+            app_id=app_id,
+            git_url=app_git_link,
+            release=release,
+            user_vars_keys=list(user_vars.keys()),
+            teams_keys=list(teams.keys()),
+            action="redeploy",
+            resource_address=resource_address,
+        )
+
+        phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
+        if not openstack_envelope:
+            raise Exception(
+                "OpenStack credential envelope missing — cannot redeploy without credentials"
+            )
+        task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
+
+        phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
+        task_logger.info(
+            f"Cloning {app_git_link} at {release} (same ref as the original deploy "
+            "so terraform code matches the pg-backend state)",
+            category=LogCategory.OPERATION,
+        )
+        try:
+            repo_path = git_service.clone_release(
+                git_url=app_git_link, deployment_id=deployment_id, tag=release
+            )
+            try:
+                import git as _git
+
+                repo = _git.Repo(repo_path)
+                commit = repo.head.commit
+                commit_info = {
+                    "hash": commit.hexsha,
+                    "message": commit.message.strip(),
+                    "author": str(commit.author),
+                    "date": commit.committed_datetime.isoformat(),
+                }
+                task_logger.success(
+                    f"Repository cloned at commit {commit.hexsha[:8]}",
+                    category=LogCategory.STATUS,
+                )
+            except Exception as e:
+                task_logger.warning(
+                    f"Could not extract commit info: {e}", category=LogCategory.WARNING
+                )
+        except Exception as e:
+            raise Exception(f"Git clone failed: {str(e)}")
+
+        phase_tracker.mark(PHASE_CREDS_MATERIALISE, "Writing per-task clouds.yaml")
+        clouds_config = PerTaskCloudsConfig(openstack_envelope, work_dir=repo_path)
+        openstack_env = clouds_config.__enter__()
+        task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
+
+        # Reconstruct the same image_name the original deploy used so
+        # the apply's variable validation matches. ``image_name`` is
+        # a HCL contract variable; mismatch would surface as a noisy
+        # "var changed" diff that wouldn't actually apply anything.
+        image_tag = (
+            commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
+        )
+        image_name = f"{app_id}-{image_tag}"
+
+        terraform_dir = os.path.join(repo_path, "terraform")
+        if not os.path.exists(terraform_dir):
+            raise Exception(f"Terraform directory not found at {terraform_dir}")
+
+        # Build the terraform var-set exactly like the original
+        # deploy did, but strip file variables — they are pure inputs
+        # to cloud-init and the templates already encode them inside
+        # the state we are recreating, so passing them again would
+        # be redundant and slightly leaky (large base64 blobs land in
+        # the worker log lines).
+        terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
+        terraform_vars = _strip_file_vars(terraform_vars)
+        # Bug #9: the original deploy's persisted ``user_vars`` were
+        # keyed on the roster at deploy time. Membership may have
+        # shifted since (team renames, members added/removed); ship
+        # the apply only the slots that still match the *current*
+        # roster so terraform doesn't choke on orphan keys.
+        terraform_vars = _reconcile_scoped_vars_to_roster(
+            terraform_vars, teams, task_logger
+        )
+        terraform_vars["image_name"] = image_name
+        if teams:
+            terraform_vars["users"] = teams
+        terraform_vars = encode_terraform_vars(terraform_vars)
+
+        terraform = TerraformExecutor(
+            terraform_dir,
+            env_vars=openstack_env,
+            backend_conn_str=tfstate_conn_str,
+            backend_schema_name=tfstate_schema,
+            output_callback=_stream_line,
+        )
+
+        phase_tracker.mark(PHASE_TERRAFORM_INIT, "Initializing Terraform")
+        success, stdout, stderr = terraform.init()
+        if not success:
+            if stdout:
+                task_logger.command_output("terraform_init_stdout", stdout, returncode=1)
+            if stderr:
+                task_logger.command_output("terraform_init_stderr", stderr, returncode=1)
+            raise Exception("Terraform init failed")
+        task_logger.success("Terraform initialization completed", category=LogCategory.STATUS)
+
+        phase_tracker.mark(
+            PHASE_TERRAFORM_APPLY,
+            f"Applying replace for {resource_address}",
+        )
+        # The two flags work together: ``-replace`` taints the single
+        # resource so terraform plans a destroy+create on it,
+        # ``-target`` scopes the apply to that resource (and anything
+        # it depends on). Without ``-target`` the apply would touch
+        # the whole deployment graph; without ``-replace`` it would
+        # often detect "no changes" and short-circuit.
+        success, stdout, stderr = terraform.apply(
+            variables=terraform_vars,
+            targets=[resource_address],
+            replace=[resource_address],
+        )
+        if not success:
+            if stdout:
+                task_logger.command_output(
+                    "terraform_apply_stdout", stdout, returncode=1
+                )
+            if stderr:
+                task_logger.command_output(
+                    "terraform_apply_stderr", stderr, returncode=1
+                )
+            raise Exception("Terraform apply (replace) failed")
+        task_logger.success(
+            f"Resource {resource_address} replaced",
+            category=LogCategory.STATUS,
+        )
+
+        phase_tracker.mark(PHASE_CLEANUP, "Pulling final state")
+        tf_state = collect_terraform_state()
+        outputs = collect_terraform_outputs()
+
+        task_logger.success(
+            f"Deployment {deployment_id} redeploy of {resource_address} completed",
+            category=LogCategory.STATUS,
+        )
+
+        return {
+            "status": "success",
+            "deployment_id": deployment_id,
+            "logs": task_logger.get_logs_dict(),
+            "tf_state": tf_state,
+            "commit_info": commit_info,
+            "terraform_outputs": outputs or {},
+        }
+
+    except Exception as e:
+        task_logger.exception(
+            f"Redeploy failed: {str(e)}", exception=e, deployment_id=deployment_id
+        )
+        if not tf_state:
+            tf_state = collect_terraform_state()
+        raise Failure(
+            message=str(e),
+            deployment_id=deployment_id,
+            logs_dict=task_logger.get_logs_dict(),
+            tf_state=tf_state,
+            commit_info=commit_info,
+            terraform_outputs=outputs or {},
+        )
+
+    finally:
+        if clouds_config is not None:
+            try:
+                clouds_config.__exit__(None, None, None)
+            except Exception as e:
+                task_logger.warning(
+                    f"Per-task clouds.yaml cleanup failed: {e}",
+                    category=LogCategory.WARNING,
+                )
+        if repo_path:
+            try:
+                git_service.cleanup_repository(repo_path)
+                task_logger.success(
+                    "Repository cleanup completed", category=LogCategory.SYSTEM
+                )
+            except Exception as e:
+                task_logger.warning(
+                    f"Repository cleanup failed: {e}", category=LogCategory.WARNING
+                )
