@@ -116,6 +116,47 @@ class Failure(Exception):
 # sites below.
 
 
+def _looks_like_file_var_value(value: Any) -> bool:
+    """True if ``value`` matches the file-upload shape produced by
+    the backend's ``_attach_files_to_user_input``: a non-empty
+    mapping whose entries each carry a ``content_b64`` field plus
+    the metadata triplet (name, size, content_type) — i.e. exactly
+    the ``map(object(...))`` HCL contract.
+
+    Used by :func:`_strip_file_vars` so destroy / cleanup-after-
+    failure can drop ``@openstack:file:*``-marked variables before
+    passing the var-set to ``terraform destroy``. Terraform
+    validates *all* declared variables on every command — including
+    destroy — so a half-filled or apply-only file-var would
+    otherwise block the cleanup with the same schema error that
+    killed the deploy.
+
+    No legacy-shape compatibility — rows from the earlier wrapped
+    format have to be cleaned up by hand (operator removes the
+    deployment row + tfstate schema). Keeping the detector strict
+    keeps the surface tight and makes future refactors easier to
+    reason about.
+    """
+    if not isinstance(value, dict) or not value:
+        return False
+    for slot in value.values():
+        if not isinstance(slot, dict):
+            return False
+        if "content_b64" not in slot:
+            return False
+    return True
+
+
+def _strip_file_vars(terraform_vars: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``terraform_vars`` with file-shape entries removed.
+
+    Pure function — never mutates the input. Used by destroy and the
+    deploy cleanup-after-failure branches; deploy itself keeps the
+    file vars because ``apply`` consumes them via cloud-init.
+    """
+    return {k: v for k, v in terraform_vars.items() if not _looks_like_file_var_value(v)}
+
+
 def encode_terraform_vars(d: dict[str, Any]) -> dict[str, str]:
     """Encode variables for ``terraform -var key=value`` CLI args.
 
@@ -706,7 +747,21 @@ def deploy_application(
                         "Running terraform destroy to clean up partially-applied resources",
                         category=LogCategory.OPERATION,
                     )
-                    terraform.destroy(variables=terraform_vars)
+                    # Rebuild the var-set from the raw user_vars,
+                    # this time without the file payloads. Destroy
+                    # doesn't need the cloud-init bytes but Terraform
+                    # still validates every declared var on every
+                    # run. A half-filled file-var carried over from
+                    # the broken apply would otherwise reject the
+                    # cleanup with the same schema error that killed
+                    # the apply, leaving orphan OpenStack resources.
+                    cleanup_tf_vars = (
+                        _strip_file_vars(user_vars.get("terraform") or {})
+                    )
+                    cleanup_tf_vars["image_name"] = image_name
+                    if teams:
+                        cleanup_tf_vars["users"] = teams
+                    terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
                     # Refresh state after destroy so the persisted record reflects cleanup.
                     tf_state = collect_terraform_state()
                 except Exception as cleanup_error:
@@ -923,7 +978,15 @@ def destroy_deployment(
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
 
+        # Drop ``@openstack:file:*`` variable values before passing
+        # the var-set to terraform destroy. Files are only consumed
+        # at apply-time (cloud-init write_files); destroy doesn't
+        # need them, but Terraform validates every declared var on
+        # every run. A half-filled file-var carried over from a
+        # broken deploy would otherwise reject destroy with the same
+        # schema error that killed the deploy in the first place.
         terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
+        terraform_vars = _strip_file_vars(terraform_vars)
         terraform_vars["image_name"] = image_name
         if teams:
             terraform_vars["users"] = teams
