@@ -13,6 +13,11 @@ from .services import (
     TerraformExecutor,
     git_service,
 )
+from .services.packer_discovery import (
+    PackerTemplateDiscoveryError,
+    _PackerTemplate,
+    _discover_packer_templates,
+)
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
@@ -312,6 +317,53 @@ _PHASES_WITHOUT_PACKER = (
     PHASE_TERRAFORM_APPLY,
     PHASE_OUTPUTS_AND_CLEANUP,
 )
+
+
+def _phases_for_templates(templates: list[_PackerTemplate]) -> tuple[str, ...]:
+    """Build the phase tuple based on the discovered Packer templates.
+
+    * No templates → ``_PHASES_WITHOUT_PACKER`` (clone, then straight
+      to terraform).
+    * One template with key ``"default"`` (legacy layout) →
+      ``_PHASES_WITH_PACKER`` verbatim. The phase names stay
+      ``PACKER_INIT`` / ``PACKER_VALIDATE`` / ``PACKER_BUILD`` with no
+      key suffix so a legacy app's stepper looks byte-identical to the
+      pre-discovery world.
+    * Multi (any other shape) → one
+      ``PACKER_INIT:<key>`` / ``PACKER_VALIDATE:<key>`` /
+      ``PACKER_BUILD:<key>`` trio per template, inserted in the same
+      position the original Packer phases occupied in
+      ``_PHASES_WITH_PACKER``. Templates are emitted in the order the
+      caller passes them in (discovery returns them sorted by key, so
+      the stepper order is deterministic).
+    """
+    if not templates:
+        return _PHASES_WITHOUT_PACKER
+    if len(templates) == 1 and templates[0].key == "default":
+        return _PHASES_WITH_PACKER
+
+    idx = next(
+        (i for i, p in enumerate(_PHASES_WITH_PACKER) if p == PHASE_PACKER_INIT),
+        0,
+    )
+    prefix = tuple(_PHASES_WITH_PACKER[:idx])
+    suffix = tuple(
+        p
+        for p in _PHASES_WITH_PACKER[idx:]
+        if p not in (PHASE_PACKER_INIT, PHASE_PACKER_VALIDATE, PHASE_PACKER_BUILD)
+    )
+    packer_phases: list[str] = []
+    for t in templates:
+        packer_phases.extend(
+            [
+                f"{PHASE_PACKER_INIT}:{t.key}",
+                f"{PHASE_PACKER_VALIDATE}:{t.key}",
+                f"{PHASE_PACKER_BUILD}:{t.key}",
+            ]
+        )
+    return prefix + tuple(packer_phases) + suffix
+
+
 # Destroy uses a shorter pipeline — no Packer (we don't need a fresh
 # image to tear things down) and no plan (terraform destroy has its own
 # planning step internally that we don't surface as its own progress
@@ -578,17 +630,32 @@ def deploy_application(
         # `release` is often a moving ref (e.g. "main", "latest") — caching by tag
         # silently serves stale images when the underlying commit changes. The
         # short SHA is content-addressed: a new commit always misses the cache.
+        #
+        # Multi-image apps declare one Packer template per subdirectory
+        # under ``packer/<key>/``. Each gets its own cached image,
+        # named ``<app_id>-<key>-<tag>``. Legacy single-template apps
+        # (``packer/template.pkr.hcl``) keep the original
+        # ``<app_id>-<tag>`` shape so a redeploy of a pre-multi app
+        # hits the same Glance entry it built before.
+        try:
+            templates = _discover_packer_templates(repo_path)
+        except PackerTemplateDiscoveryError as e:
+            raise Exception(f"Packer template discovery failed: {e}")
+
         image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        image_name = f"{app_id}-{image_tag}"
+        if len(templates) == 1 and templates[0].key == "default":
+            image_names = {"default": f"{app_id}-{image_tag}"}
+        else:
+            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
 
         # Decide once whether this deployment needs a Packer build, and
         # adapt the phase total accordingly so the percent bar is honest.
         # The pessimistic default (assume Packer) was set at task start;
         # if the cloned repo has no Packer template we drop those three
         # phases now so the next progress event lands on the right index.
-        packer_file = os.path.join(repo_path, "packer", "template.pkr.hcl")
-        if not os.path.exists(packer_file):
-            phase_tracker = _PhaseTracker(task_logger, _PHASES_WITHOUT_PACKER)
+        # For multi-image apps, ``_phases_for_templates`` expands the
+        # Packer phases per template instead.
+        phase_tracker = _PhaseTracker(task_logger, _phases_for_templates(templates))
 
         # The output callback feeds each line of subprocess output into the
         # task logger as a streaming entry, which then ships it via the
@@ -600,100 +667,139 @@ def deploy_application(
         # Phase 3: Packer (optional) — guarded by a Redis lock keyed on
         # (project_id, image_name) so two parallel workers can't both kick
         # off a build for the same image and end up with duplicate Glance
-        # entries plus wasted compute.
-        if os.path.exists(packer_file):
+        # entries plus wasted compute. For multi-image apps each template
+        # has its own lock + image-exists check, so two workers can build
+        # different images of the same app in parallel.
+        if not templates:
+            task_logger.info("No Packer template found, skipping image build", category=LogCategory.SYSTEM)
+        else:
             project_id = openstack_envelope.get("project_id") or openstack_envelope.get("project_name") or "default"
-            build_lock = PackerBuildLock(project_id, image_name)
             openstack_service = OpenStackService(env_vars=openstack_env)
-            wait_announced = False
-            try:
-                while True:
-                    # If the image already exists, skip the build and the lock.
-                    exists, image_id = openstack_service.check_image_exists(image_name)
-                    if exists:
-                        task_logger.success(
-                            f"Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
-                            category=LogCategory.STATUS,
-                        )
-                        # Skip Packer phases on the progress bar — jump
-                        # directly past Build, the next mark() call is for
-                        # Terraform.
-                        break
+            is_legacy = len(templates) == 1 and templates[0].key == "default"
 
-                    held = build_lock.acquire_or_wait()
-                    if not held:
-                        # Another worker is still building the same image.
-                        # Surface this in the per-deployment log once so
-                        # the frontend's live tail shows *something*
-                        # during the 5-second poll cycles — without it the
-                        # browser sees no events and looks frozen.
-                        if not wait_announced:
-                            task_logger.info(
-                                f"Another worker is currently building image '{image_name}'. Waiting…",
+            for tmpl in templates:
+                image_name = image_names[tmpl.key]
+                log_prefix = "" if is_legacy else f"[{tmpl.key}] "
+
+                # Phase names: legacy stays unsuffixed so the stepper
+                # for a pre-multi app is byte-identical; multi-template
+                # apps get one ``PHASE:<key>`` trio per template.
+                init_phase = PHASE_PACKER_INIT if is_legacy else f"{PHASE_PACKER_INIT}:{tmpl.key}"
+                validate_phase = (
+                    PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
+                )
+                build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
+
+                build_lock = PackerBuildLock(project_id, image_name)
+                wait_announced = False
+                try:
+                    while True:
+                        # If the image already exists, skip the build and the lock.
+                        exists, image_id = openstack_service.check_image_exists(image_name)
+                        if exists:
+                            task_logger.success(
+                                f"{log_prefix}Image '{image_name}' already exists (ID: {image_id}). Skipping Packer build.",
                                 category=LogCategory.STATUS,
                             )
-                            wait_announced = True
-                        # We slept inside acquire_or_wait; re-check Glance.
-                        continue
+                            break
 
-                    # Re-check after acquiring: another worker may have
-                    # finished its build between our last check and our lock
-                    # acquisition.
-                    exists, image_id = openstack_service.check_image_exists(image_name)
-                    if exists:
+                        held = build_lock.acquire_or_wait()
+                        if not held:
+                            # Another worker is still building the same image.
+                            # Surface this in the per-deployment log once so
+                            # the frontend's live tail shows *something*
+                            # during the 5-second poll cycles — without it the
+                            # browser sees no events and looks frozen.
+                            if not wait_announced:
+                                task_logger.info(
+                                    f"{log_prefix}Another worker is currently building image '{image_name}'. Waiting…",
+                                    category=LogCategory.STATUS,
+                                )
+                                wait_announced = True
+                            # We slept inside acquire_or_wait; re-check Glance.
+                            continue
+
+                        # Re-check after acquiring: another worker may have
+                        # finished its build between our last check and our lock
+                        # acquisition.
+                        exists, image_id = openstack_service.check_image_exists(image_name)
+                        if exists:
+                            task_logger.success(
+                                f"{log_prefix}Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
+                                category=LogCategory.STATUS,
+                            )
+                            break
+
+                        task_logger.info(
+                            f"{log_prefix}Image '{image_name}' does not exist. Building...",
+                            category=LogCategory.OPERATION,
+                        )
+
+                        # Pick the right packer working directory: legacy
+                        # uses ``packer/`` directly; multi uses
+                        # ``packer/<key>/``. Template file name is always
+                        # ``template.pkr.hcl`` relative to that directory.
+                        packer_dir = (
+                            os.path.join(repo_path, "packer")
+                            if is_legacy
+                            else os.path.join(repo_path, "packer", tmpl.key)
+                        )
+                        packer = PackerExecutor(
+                            packer_dir,
+                            env_vars=openstack_env,
+                            output_callback=_stream_line,
+                        )
+
+                        # Per-template Packer variables. Legacy shape is
+                        # the flat ``user_vars["packer"][var_name]``;
+                        # multi shape is nested ``user_vars["packer"][template_key][var_name]``.
+                        if is_legacy:
+                            user_packer = user_vars["packer"] if "packer" in user_vars else {}
+                        else:
+                            user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
+                        packer_vars = {**user_packer}
+                        packer_vars["image_name"] = image_name
+                        packer_vars = encode_packer_vars(packer_vars)
+
+                        task_logger.info(
+                            f"{log_prefix}Packer variable keys",
+                            category=LogCategory.OPERATION,
+                            keys=list(packer_vars.keys()),
+                            template=tmpl.key,
+                            image_name=image_name,
+                        )
+
+                        phase_tracker.mark(init_phase, f"{log_prefix}Initializing Packer plugins")
+                        success, stdout, stderr = packer.init()
+                        if not success:
+                            if stdout:
+                                task_logger.command_output("packer_init_stdout", stdout, returncode=1)
+                            if stderr:
+                                task_logger.command_output("packer_init_stderr", stderr, returncode=1)
+                            raise Exception(f"{log_prefix}Packer init failed")
+
+                        phase_tracker.mark(validate_phase, f"{log_prefix}Validating Packer template")
+                        success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
+                        if not success:
+                            raise Exception(f"{log_prefix}Packer validation failed: {stderr}")
+
+                        phase_tracker.mark(
+                            build_phase,
+                            f"{log_prefix}Building image '{image_name}' (this may take minutes)",
+                        )
+                        success, output = packer.build("template.pkr.hcl", packer_vars)
+                        if not success:
+                            raise Exception(f"{log_prefix}Packer build failed: {output}")
+
                         task_logger.success(
-                            f"Image '{image_name}' built by another worker (ID: {image_id}). Skipping.",
+                            f"{log_prefix}Image '{image_name}' built successfully",
                             category=LogCategory.STATUS,
                         )
                         break
-
-                    task_logger.info(
-                        f"Image '{image_name}' does not exist. Building...", category=LogCategory.OPERATION
-                    )
-                    packer = PackerExecutor(
-                        os.path.join(repo_path, "packer"),
-                        env_vars=openstack_env,
-                        output_callback=_stream_line,
-                    )
-
-                    phase_tracker.mark(PHASE_PACKER_INIT, "Initializing Packer plugins")
-                    success, stdout, stderr = packer.init()
-                    if not success:
-                        if stdout:
-                            task_logger.command_output("packer_init_stdout", stdout, returncode=1)
-                        if stderr:
-                            task_logger.command_output("packer_init_stderr", stderr, returncode=1)
-                        raise Exception("Packer init failed")
-
-                    # Merge user_vars with teams for Packer
-                    packer_vars = {**user_vars["packer"]} if "packer" in user_vars else {}
-                    packer_vars["image_name"] = image_name
-                    packer_vars = encode_packer_vars(packer_vars)
-
-                    task_logger.info(
-                        "Packer variable keys",
-                        category=LogCategory.OPERATION,
-                        keys=list(packer_vars.keys()),
-                    )
-
-                    phase_tracker.mark(PHASE_PACKER_VALIDATE, "Validating Packer template")
-                    success, stdout, stderr = packer.validate("template.pkr.hcl", packer_vars)
-                    if not success:
-                        raise Exception(f"Packer validation failed: {stderr}")
-
-                    phase_tracker.mark(PHASE_PACKER_BUILD, "Building image (this may take minutes)")
-                    success, output = packer.build("template.pkr.hcl", packer_vars)
-                    if not success:
-                        raise Exception(f"Packer build failed: {output}")
-
-                    task_logger.success("Packer image built successfully", category=LogCategory.STATUS)
-                    break
-            except Exception as e:
-                raise Exception(f"Packer error: {str(e)}")
-            finally:
-                build_lock.release()
-        else:
-            task_logger.info("No Packer template found, skipping image build", category=LogCategory.SYSTEM)
+                except Exception as e:
+                    raise Exception(f"Packer error: {str(e)}")
+                finally:
+                    build_lock.release()
 
         # Phase 4: Terraform
         terraform_dir = os.path.join(repo_path, "terraform")
@@ -731,7 +837,16 @@ def deploy_application(
             # escaped quotes inside the JSON for ``users``, which is what
             # caused the silent ``terraform plan`` failure.
             terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
-            terraform_vars["image_name"] = image_name
+            # Per-template image-name injection. Legacy single-template
+            # apps see ``image_name`` (no key suffix) so a pre-multi
+            # template's HCL declaration keeps working unmodified.
+            # Multi-image apps declare one ``image_name_<key>`` per
+            # template and the worker fills them all here.
+            if len(templates) == 1 and templates[0].key == "default":
+                terraform_vars["image_name"] = image_names["default"]
+            else:
+                for key, name in image_names.items():
+                    terraform_vars[f"image_name_{key}"] = name
             if teams:
                 terraform_vars["users"] = teams
             terraform_vars = encode_terraform_vars(terraform_vars)
@@ -821,7 +936,11 @@ def deploy_application(
                     cleanup_tf_vars = (
                         _strip_file_vars(user_vars.get("terraform") or {})
                     )
-                    cleanup_tf_vars["image_name"] = image_name
+                    if len(templates) == 1 and templates[0].key == "default":
+                        cleanup_tf_vars["image_name"] = image_names["default"]
+                    else:
+                        for key, name in image_names.items():
+                            cleanup_tf_vars[f"image_name_{key}"] = name
                     if teams:
                         cleanup_tf_vars["users"] = teams
                     terraform.destroy(variables=encode_terraform_vars(cleanup_tf_vars))
@@ -1029,13 +1148,23 @@ def destroy_deployment(
         openstack_env = clouds_config.__enter__()
         task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
 
-        # Reconstruct the same image_name the deploy task used so the
-        # variables match what terraform's state expects to validate.
-        # Glance still has the image, even if we won't be using it; the
-        # variable just has to be a non-empty string that satisfies the
-        # HCL declaration.
+        # Reconstruct the same image_name map the deploy task used so
+        # the variables match what terraform's state expects to
+        # validate. Glance still has the image(s), even if we won't be
+        # using them; the variable just has to be a non-empty string
+        # that satisfies the HCL declaration. For multi-image apps we
+        # discover templates here too so the right ``image_name_<key>``
+        # suffix is injected per template.
+        try:
+            templates = _discover_packer_templates(repo_path)
+        except PackerTemplateDiscoveryError as e:
+            raise Exception(f"Packer template discovery failed: {e}")
+
         image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        image_name = f"{app_id}-{image_tag}"
+        if not templates or (len(templates) == 1 and templates[0].key == "default"):
+            image_names = {"default": f"{app_id}-{image_tag}"}
+        else:
+            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1050,7 +1179,14 @@ def destroy_deployment(
         # schema error that killed the deploy in the first place.
         terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
         terraform_vars = _strip_file_vars(terraform_vars)
-        terraform_vars["image_name"] = image_name
+        # Inject the per-template image-name variables. Legacy single
+        # template (or no Packer at all) keeps the flat ``image_name``;
+        # multi-template apps get one ``image_name_<key>`` per template.
+        if not templates or (len(templates) == 1 and templates[0].key == "default"):
+            terraform_vars["image_name"] = image_names["default"]
+        else:
+            for key, name in image_names.items():
+                terraform_vars[f"image_name_{key}"] = name
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
@@ -1795,14 +1931,24 @@ def redeploy_resource(
         openstack_env = clouds_config.__enter__()
         task_logger.success("Per-task clouds.yaml written", category=LogCategory.STATUS)
 
-        # Reconstruct the same image_name the original deploy used so
-        # the apply's variable validation matches. ``image_name`` is
-        # a HCL contract variable; mismatch would surface as a noisy
-        # "var changed" diff that wouldn't actually apply anything.
+        # Reconstruct the same image_name map the original deploy
+        # used so the apply's variable validation matches.
+        # ``image_name`` (or ``image_name_<key>`` per template for
+        # multi-image apps) is a HCL contract variable; a mismatch
+        # would surface as a noisy "var changed" diff that wouldn't
+        # actually apply anything.
+        try:
+            templates = _discover_packer_templates(repo_path)
+        except PackerTemplateDiscoveryError as e:
+            raise Exception(f"Packer template discovery failed: {e}")
+
         image_tag = (
             commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         )
-        image_name = f"{app_id}-{image_tag}"
+        if not templates or (len(templates) == 1 and templates[0].key == "default"):
+            image_names = {"default": f"{app_id}-{image_tag}"}
+        else:
+            image_names = {t.key: f"{app_id}-{t.key}-{image_tag}" for t in templates}
 
         terraform_dir = os.path.join(repo_path, "terraform")
         if not os.path.exists(terraform_dir):
@@ -1824,7 +1970,13 @@ def redeploy_resource(
         terraform_vars = _reconcile_scoped_vars_to_roster(
             terraform_vars, teams, task_logger
         )
-        terraform_vars["image_name"] = image_name
+        # Inject the per-template image-name variables (legacy: flat
+        # ``image_name``; multi: one ``image_name_<key>`` per template).
+        if not templates or (len(templates) == 1 and templates[0].key == "default"):
+            terraform_vars["image_name"] = image_names["default"]
+        else:
+            for key, name in image_names.items():
+                terraform_vars[f"image_name_{key}"] = name
         if teams:
             terraform_vars["users"] = teams
         terraform_vars = encode_terraform_vars(terraform_vars)
