@@ -426,12 +426,29 @@ class StructuredLogger:
             )
         )
 
-    def progress(self, phase_name: str, idx: int, total: int, message: str = "") -> None:
+    def progress(
+        self,
+        phase_name: str,
+        idx: int,
+        total: int,
+        message: str = "",
+        phase_names: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
         """Send a progress update without buffering a per-step transcript entry.
 
         The buffered transcript shouldn't grow by 11 progress markers per
         deploy — those are noise once the run is done. We still emit the
         Celery custom event so the listener can update the DB and the UI.
+
+        ``phase_names`` is the full ordered list of phases for this task
+        (e.g. ``("STARTING", "OPENSTACK_SETUP", ..., "PACKER_BUILD:database",
+        "PACKER_INIT:webserver", ...)`` for a multi-image deploy). When
+        provided, the UI can render every stepper slot with its real
+        label immediately, without having to wait for the worker to
+        traverse each phase or to guess template keys from observation
+        order. The payload is small (< 1 KB even for 20+ phases) and is
+        safe to repeat on every progress event — the listener just
+        overwrites its cached copy.
 
         Important: do NOT put a ``timestamp`` field in the payload. Celery
         injects one itself (as a Unix-time float) and uses it in
@@ -442,19 +459,21 @@ class StructuredLogger:
         """
         pct = max(0, min(100, round((idx / max(total, 1)) * 100)))
         if self._event_emitter is not None:
+            payload: dict[str, Any] = {
+                "phase": phase_name,
+                "phase_index": idx,
+                "total_phases": total,
+                "progress_pct": pct,
+                "message": message,
+                "correlation_id": self.correlation_id,
+                "iso_timestamp": _now_iso(),
+            }
+            if phase_names is not None:
+                # Keep as a plain list — Celery uses JSON serialisation
+                # by default and tuples are coerced anyway.
+                payload["phase_names"] = list(phase_names)
             with contextlib.suppress(Exception):
-                self._event_emitter(
-                    self.PROGRESS_EVENT_NAME,
-                    {
-                        "phase": phase_name,
-                        "phase_index": idx,
-                        "total_phases": total,
-                        "progress_pct": pct,
-                        "message": message,
-                        "correlation_id": self.correlation_id,
-                        "iso_timestamp": _now_iso(),
-                    },
-                )
+                self._event_emitter(self.PROGRESS_EVENT_NAME, payload)
 
     def operation_start(self, operation_name: str, **context: Any) -> None:
         if self.track_timing:

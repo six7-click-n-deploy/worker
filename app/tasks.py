@@ -441,8 +441,18 @@ class _PhaseTracker:
             self._logger.phase(phase_name)
             return
         # Buffer the readable phase header AND emit the live progress event.
+        # Send the full phase-name sequence with every event so the UI can
+        # render every stepper slot with its real (template-key-suffixed)
+        # label immediately, instead of having to guess template keys
+        # from observation order.
         self._logger.phase(phase_name)
-        self._logger.progress(phase_name, idx, self.total, message)
+        self._logger.progress(
+            phase_name,
+            idx,
+            self.total,
+            message,
+            phase_names=self._phases,
+        )
 
 
 @celery_app.task(bind=True, name="tasks.deploy_application")
