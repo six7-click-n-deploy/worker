@@ -274,9 +274,40 @@ class TerraformExecutor:
             logger.operation_end("terraform_plan", success=False)
             return False, "", str(e)
 
-    def apply(self, var_file: str | None = None, variables: dict[str, Any] | None = None) -> tuple[bool, str, str]:
-        """Run terraform apply."""
-        logger.operation_start("terraform_apply", var_file=var_file, var_count=len(variables or {}))
+    def apply(
+        self,
+        var_file: str | None = None,
+        variables: dict[str, Any] | None = None,
+        targets: list[str] | None = None,
+        replace: list[str] | None = None,
+    ) -> tuple[bool, str, str]:
+        """Run terraform apply.
+
+        Args:
+            var_file: Optional ``-var-file`` value.
+            variables: Optional ``-var KEY=VALUE`` map.
+            targets:  Optional list of resource addresses to pass via
+                ``-target=…``. Used by the per-VM redeploy task to scope
+                an apply to ONE compute instance — leaves the rest of
+                the deployment untouched. Each entry MUST be a single
+                terraform state address (``type.name[index]``); passing
+                a malformed value would expand into a different CLI
+                flag, so the worker is the line of defense (callers in
+                the backend additionally whitelist against the state).
+            replace: Optional list of resource addresses to pass via
+                ``-replace=…``. Combined with ``targets`` for the
+                redeploy contract: the targeted resource gets
+                explicitly tainted so terraform destroys + recreates
+                it instead of detecting "no changes" and short-
+                circuiting. Same validation rules as ``targets``.
+        """
+        logger.operation_start(
+            "terraform_apply",
+            var_file=var_file,
+            var_count=len(variables or {}),
+            target_count=len(targets or []),
+            replace_count=len(replace or []),
+        )
         try:
             cmd = [self.terraform_path, "apply", "-auto-approve", "-input=false"]
             if var_file:
@@ -284,6 +315,16 @@ class TerraformExecutor:
             if variables:
                 for key, value in variables.items():
                     cmd.extend(["-var", f"{key}={value}"])
+            # Targets / replaces must be a plain list of addresses; we
+            # don't validate the shape here (the caller has already
+            # whitelisted against the cached TF state). Passing them as
+            # separate ``[flag, value]`` pairs to subprocess avoids
+            # shell quoting concerns — double-quotes inside the address
+            # (``team_ide["Team-A"]``) reach Terraform unmodified.
+            for tgt in targets or []:
+                cmd.extend(["-target", tgt])
+            for repl in replace or []:
+                cmd.extend(["-replace", repl])
 
             logger.info("Applying Terraform configuration (this may take minutes)...", category=LogCategory.STATUS)
 
