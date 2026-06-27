@@ -41,6 +41,13 @@ mypy = "^1.8"
 pytest = "^8.0"
 pytest-asyncio = "^0.23"
 pytest-cov = "^4.1"
+# pytest-timeout: kills a single test after ``timeout`` seconds so
+# a hung dependency call (e.g. a real git clone that escaped its
+# mock, a Celery broker connection that wasn't faked) cannot
+# freeze the entire run. ``timeout_method = "thread"`` is essential
+# — the default ``signal`` method cannot interrupt C-extension
+# calls or subprocess waits.
+pytest-timeout = "^2.3"
 httpx = "^0.26"
 pytest-mock = "^3.12"
 
@@ -132,6 +139,17 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
+    # Globaler Per-Test-Timeout: kein einzelner Test darf den
+    # Gesamtlauf einfrieren. 60 s ist großzügig für Git-Clone-Mocks
+    # und subprocess-Calls, aber knapp genug, dass ein echter Hänger
+    # (z.B. realer Netz-Call, hängender Broker) auffällt statt CI zu
+    # blockieren. Einzeltests dürfen mit
+    # ``@pytest.mark.timeout(N)`` lokal hochgesetzt werden.
+    "--timeout=60",
+    # ``thread`` ist Pflicht: das default-``signal``-Verfahren
+    # benutzt ``SIGALRM`` und kann C-Extension-Calls oder blockierte
+    # subprocess-waits nicht unterbrechen.
+    "--timeout-method=thread",
 ]
 markers = [
     "unit: Unit tests",
