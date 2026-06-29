@@ -469,7 +469,7 @@ jobs:
     steps:
       - name: Trigger staging deployment
         run: |
-          gh workflow run staging-deploy.yml \
+          gh workflow run staging.yml \
             --repo six7-click-n-deploy/deployment \
             --ref main
         env:
