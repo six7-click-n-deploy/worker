@@ -8,16 +8,14 @@ under ``tmp_path``: legacy layout, multi-template layout, missing/empty
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
-from app.services.packer_discovery import (
-    PackerTemplateDiscoveryError,
-    _discover_packer_templates,
-    _PackerTemplate,
-)
+from app.services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
 pytestmark = pytest.mark.unit
 
@@ -31,9 +29,7 @@ def _make_legacy_layout(root: Path, *, with_variables: bool = False) -> None:
         (packer / "variables.pkr.hcl").write_text("# legacy variables")
 
 
-def _make_subdir_template(
-    root: Path, key: str, *, with_variables: bool = False
-) -> None:
+def _make_subdir_template(root: Path, key: str, *, with_variables: bool = False) -> None:
     """Create ``packer/<key>/template.pkr.hcl`` under ``root``."""
     sub = root / "packer" / key
     sub.mkdir(parents=True, exist_ok=True)
@@ -107,9 +103,7 @@ class TestLegacyLayout:
         assert tmpl.variables_path == str(tmp_path / "packer" / "variables.pkr.hcl")
         assert not os.path.isfile(tmpl.variables_path)
 
-    def test_legacy_layout_with_helper_subdir_without_template_is_still_legacy(
-        self, tmp_path
-    ):
+    def test_legacy_layout_with_helper_subdir_without_template_is_still_legacy(self, tmp_path):
         """A helper subdir without ``template.pkr.hcl`` does not turn it into multi-mode."""
         _make_legacy_layout(tmp_path)
         helpers = tmp_path / "packer" / "_common"
@@ -143,7 +137,7 @@ class TestMultiTemplateLayout:
 
         result = _discover_packer_templates(str(tmp_path))
 
-        assert [t.key == k for t, k in zip(result, sorted(["zeta", "alpha", "mid_2", "beta-1"]))]
+        assert [t.key == k for t, k in zip(result, sorted(["zeta", "alpha", "mid_2", "beta-1"]), strict=False)]
         assert [t.key for t in result] == sorted(["zeta", "alpha", "mid_2", "beta-1"])
 
     def test_multi_layout_paths_are_absolute_under_subdir(self, tmp_path):
@@ -155,12 +149,8 @@ class TestMultiTemplateLayout:
         assert len(result) == 1
         tmpl = result[0]
         assert tmpl.key == "web"
-        assert tmpl.template_path == str(
-            tmp_path / "packer" / "web" / "template.pkr.hcl"
-        )
-        assert tmpl.variables_path == str(
-            tmp_path / "packer" / "web" / "variables.pkr.hcl"
-        )
+        assert tmpl.template_path == str(tmp_path / "packer" / "web" / "template.pkr.hcl")
+        assert tmpl.variables_path == str(tmp_path / "packer" / "web" / "variables.pkr.hcl")
 
     def test_multi_layout_variables_path_returned_even_when_missing(self, tmp_path):
         """``variables_path`` is returned in multi mode even when the file is absent."""

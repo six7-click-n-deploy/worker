@@ -7,12 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.services import terraform_executor as te_mod
-from app.services.terraform_executor import (
-    TerraformExecutor,
-    _pg_backend_override_hcl,
-    _stream_subprocess,
-)
-
+from app.services.terraform_executor import TerraformExecutor, _pg_backend_override_hcl, _stream_subprocess
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,8 +21,7 @@ class _FakeStdout:
         self._lines = list(lines)
 
     def __iter__(self):
-        for line in self._lines:
-            yield line
+        yield from self._lines
 
 
 class FakePopen:
@@ -305,9 +299,7 @@ class TestInit:
         assert stdout == "initialized"
         assert stderr == ""
         cmd = stream.call_args.args[0]
-        assert cmd[-3:] == [ex.terraform_path, "init", "-input=false"] or (
-            cmd[1:] == ["init", "-input=false"]
-        )
+        assert cmd[-3:] == [ex.terraform_path, "init", "-input=false"] or (cmd[1:] == ["init", "-input=false"])
         assert "-reconfigure" not in cmd
         assert stream.call_args.kwargs["timeout"] == 300
         assert stream.call_args.kwargs["tool_name"] == "terraform_init"

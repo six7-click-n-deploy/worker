@@ -1,6 +1,5 @@
 """Tests for the Redis-backed PackerBuildLock service."""
 
-import threading
 import time
 from unittest.mock import MagicMock
 
@@ -73,9 +72,7 @@ class TestAcquireOrWait:
 
         assert result is True
         assert fast_lock._held is True
-        fake_redis.set.assert_called_once_with(
-            fast_lock.key, fast_lock.token, nx=True, px=fast_lock.ttl_ms
-        )
+        fake_redis.set.assert_called_once_with(fast_lock.key, fast_lock.token, nx=True, px=fast_lock.ttl_ms)
         fast_lock.release()
 
     def test_acquire_starts_heartbeat_thread(self, fast_lock, fake_redis):
@@ -105,9 +102,7 @@ class TestAcquireOrWait:
         """acquire_or_wait sleeps for poll_interval_s when waiting on another holder."""
         fake_redis.set.return_value = False
         sleep_mock = mocker.patch.object(build_lock_module.time, "sleep")
-        lock = PackerBuildLock(
-            "p", "i", heartbeat_interval_s=0.05, poll_interval_s=7, total_wait_s=60
-        )
+        lock = PackerBuildLock("p", "i", heartbeat_interval_s=0.05, poll_interval_s=7, total_wait_s=60)
 
         lock.acquire_or_wait()
 
@@ -116,9 +111,7 @@ class TestAcquireOrWait:
     def test_acquire_raises_timeout_when_deadline_passed(self, fake_redis):
         """acquire_or_wait raises TimeoutError when SET fails AND the deadline is past."""
         fake_redis.set.return_value = False
-        lock = PackerBuildLock(
-            "p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60
-        )
+        lock = PackerBuildLock("p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60)
         # Force the deadline into the past.
         lock.deadline = time.monotonic() - 1
 
@@ -132,9 +125,7 @@ class TestAcquireOrWait:
         fake_redis.set.return_value = False
         fake_redis.pttl.return_value = -2
         mocker.patch.object(build_lock_module.time, "sleep")
-        lock = PackerBuildLock(
-            "p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60
-        )
+        lock = PackerBuildLock("p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60)
 
         result = lock.acquire_or_wait()
 
@@ -163,9 +154,7 @@ class TestRelease:
         fast_lock.release()
 
         # Find at least one call matching the release script signature.
-        release_calls = [
-            c for c in fake_redis.eval.call_args_list if c.args and c.args[0] == _LUA_RELEASE
-        ]
+        release_calls = [c for c in fake_redis.eval.call_args_list if c.args and c.args[0] == _LUA_RELEASE]
         assert release_calls, "Expected _LUA_RELEASE eval"
         call = release_calls[0]
         assert call.args == (_LUA_RELEASE, 1, fast_lock.key, fast_lock.token)
@@ -210,9 +199,7 @@ class TestHeartbeat:
         time.sleep(0.2)  # let at least one heartbeat tick fire
         fast_lock.release()
 
-        renew_calls = [
-            c for c in fake_redis.eval.call_args_list if c.args and c.args[0] == _LUA_RENEW
-        ]
+        renew_calls = [c for c in fake_redis.eval.call_args_list if c.args and c.args[0] == _LUA_RENEW]
         assert renew_calls, "Expected at least one _LUA_RENEW eval"
         # Each renew call: (script, 1, key, token, ttl_ms)
         first = renew_calls[0]
@@ -226,9 +213,7 @@ class TestHeartbeat:
 
         warn_spy = mocker.spy(build_lock_module.logger, "warning")
 
-        lock = PackerBuildLock(
-            "p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60
-        )
+        lock = PackerBuildLock("p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60)
         lock.acquire_or_wait()
         time.sleep(0.25)
         # Lock should still be considered held since renewals after the blip succeeded.
@@ -246,9 +231,7 @@ class TestHeartbeat:
 
         warn_spy = mocker.spy(build_lock_module.logger, "warning")
 
-        lock = PackerBuildLock(
-            "p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60
-        )
+        lock = PackerBuildLock("p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60)
         lock.acquire_or_wait()
         time.sleep(0.2)
 
@@ -264,9 +247,7 @@ class TestHeartbeat:
         # release() should be a no-op here because _held was flipped off.
         fake_redis.eval.reset_mock()
         lock.release()
-        release_calls = [
-            c for c in fake_redis.eval.call_args_list if c.args and c.args[0] == _LUA_RELEASE
-        ]
+        release_calls = [c for c in fake_redis.eval.call_args_list if c.args and c.args[0] == _LUA_RELEASE]
         assert not release_calls
 
 
@@ -289,9 +270,7 @@ class TestContextManager:
     def test_with_block_releases_on_exit(self, fake_redis):
         """Using the lock as a context manager releases it cleanly on block exit."""
         fake_redis.set.return_value = True
-        lock = PackerBuildLock(
-            "p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60
-        )
+        lock = PackerBuildLock("p", "i", heartbeat_interval_s=0.05, poll_interval_s=0, total_wait_s=60)
 
         with lock as acquired:
             assert acquired is lock

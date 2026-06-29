@@ -49,7 +49,6 @@ import os
 import re
 from dataclasses import dataclass
 
-
 _TEMPLATE_KEY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}$")
 
 
@@ -113,8 +112,7 @@ def _discover_packer_templates(repo_path: str) -> list[_PackerTemplate]:
 
     if bad_keys:
         raise PackerTemplateDiscoveryError(
-            f"Packer template subdirectories with invalid keys (must match "
-            f"[a-z][a-z0-9_-]{{0,30}}): {bad_keys}"
+            f"Packer template subdirectories with invalid keys (must match " f"[a-z][a-z0-9_-]{{0,30}}): {bad_keys}"
         )
 
     if has_legacy and multi_templates:

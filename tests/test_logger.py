@@ -32,7 +32,6 @@ from app.utils.logger import (
     truncate_text,
 )
 
-
 # ---------------------------------------------------------------------------
 # clean_text
 # ---------------------------------------------------------------------------
@@ -191,12 +190,12 @@ class TestNowIso:
 @pytest.mark.unit
 class TestLogEntry:
     def _make(self, **overrides: Any) -> LogEntry:
-        base: dict[str, Any] = dict(
-            timestamp="2026-01-01T00:00:00Z",
-            level=LogLevel.INFO,
-            category=LogCategory.SYSTEM,
-            message="hello",
-        )
+        base: dict[str, Any] = {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "level": LogLevel.INFO,
+            "category": LogCategory.SYSTEM,
+            "message": "hello",
+        }
         base.update(overrides)
         return LogEntry(**base)
 
@@ -368,9 +367,7 @@ class TestStructuredLoggerProgress:
     def test_progress_emits_event_with_clamped_pct(self):
         """progress() emits a PROGRESS event with progress_pct clamped to 0..100."""
         events: list[tuple[str, dict[str, Any]]] = []
-        log = StructuredLogger(
-            "p", console=False, event_emitter=lambda n, p: events.append((n, p))
-        )
+        log = StructuredLogger("p", console=False, event_emitter=lambda n, p: events.append((n, p)))
         log.progress("phase1", 2, 4, "halfway")
         assert len(events) == 1
         name, payload = events[0]

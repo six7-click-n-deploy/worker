@@ -17,12 +17,12 @@ import os
 import pytest
 
 from app.tasks import (
+    _PHASES_WITH_PACKER,
     Failure,
     _build_current_roster,
     _looks_like_file_var_value,
-    _PHASES_WITH_PACKER,
-    _PhaseTracker,
     _phases_for_templates,
+    _PhaseTracker,
     _reconcile_scoped_vars_to_roster,
     _scrub_nested_nones,
     _strip_file_vars,
@@ -35,7 +35,6 @@ from app.tasks import (
     redeploy_resource,
     resume_deployment,
 )
-
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -61,8 +60,7 @@ def _make_clouds_config_mock(mocker):
     return cls, cc
 
 
-def _make_terraform_executor_mock(mocker, *, init=True, plan=True, apply_=True,
-                                    destroy=True, state="{}", output=None):
+def _make_terraform_executor_mock(mocker, *, init=True, plan=True, apply_=True, destroy=True, state="{}", output=None):
     """Patch ``TerraformExecutor`` so every method returns the supplied stub.
 
     The same instance is returned for every constructor call so the test can
@@ -125,6 +123,7 @@ def _patch_git_repo(mocker):
     repo_obj.head.commit = fake_commit
 
     import sys
+
     fake_git_mod = mocker.MagicMock()
     fake_git_mod.Repo.return_value = repo_obj
     mocker.patch.dict(sys.modules, {"git": fake_git_mod})
@@ -292,6 +291,7 @@ class TestFailureRoundTrip:
     def test_pickle_round_trip_via_reduce(self):
         """``__reduce__`` allows pickling without re-encoding the payload."""
         import pickle
+
         f = Failure("err", "dep-1", logs_dict=[], tf_state=None)
         restored = pickle.loads(pickle.dumps(f))
         assert isinstance(restored, Failure)
@@ -348,8 +348,7 @@ class TestDeployApplication:
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
-        mocker.patch("app.tasks._discover_packer_templates",
-                     return_value=[_FakeTemplate("default")])
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("default")])
         _make_openstack_service_mock(mocker, image_exists=False)
         _, lock_inst = _make_build_lock_mock(mocker, held=True)
         _, packer_inst = _make_packer_mock(mocker)
@@ -360,8 +359,7 @@ class TestDeployApplication:
             app_id="myapp",
             app_git_link="https://git/repo.git",
             release="v1",
-            user_vars={"packer": {"flavor": "m1.small"},
-                       "terraform": {"region": "eu"}},
+            user_vars={"packer": {"flavor": "m1.small"}, "terraform": {"region": "eu"}},
             teams={"T1": [{"email": "a@x"}]},
             openstack_envelope={"project_id": "p1"},
         )
@@ -386,8 +384,7 @@ class TestDeployApplication:
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
-        mocker.patch("app.tasks._discover_packer_templates",
-                     return_value=[_FakeTemplate("web"), _FakeTemplate("db")])
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("web"), _FakeTemplate("db")])
         _make_openstack_service_mock(mocker, image_exists=False)
         _make_build_lock_mock(mocker, held=True)
         _, packer_inst = _make_packer_mock(mocker)
@@ -398,8 +395,7 @@ class TestDeployApplication:
             app_id="myapp",
             app_git_link="https://git/repo.git",
             release="v1",
-            user_vars={"packer": {"web": {"f": "x"}, "db": {"f": "y"}},
-                       "terraform": {}},
+            user_vars={"packer": {"web": {"f": "x"}, "db": {"f": "y"}}, "terraform": {}},
             teams=None,
             openstack_envelope={"project_id": "p1"},
         )
@@ -420,8 +416,7 @@ class TestDeployApplication:
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
-        mocker.patch("app.tasks._discover_packer_templates",
-                     return_value=[_FakeTemplate("default")])
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("default")])
         _make_openstack_service_mock(mocker, image_exists=True)
         _, lock_inst = _make_build_lock_mock(mocker)
         _, packer_inst = _make_packer_mock(mocker)
@@ -453,8 +448,7 @@ class TestDeployApplication:
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
-        mocker.patch("app.tasks._discover_packer_templates",
-                     return_value=[_FakeTemplate("default")])
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("default")])
 
         os_inst = mocker.MagicMock()
         os_inst.check_image_exists.side_effect = [(False, None), (True, "id-x")]
@@ -491,8 +485,7 @@ class TestDeployApplication:
         _make_git_mock(mocker, repo_path)
         _patch_git_repo(mocker)
         _make_clouds_config_mock(mocker)
-        mocker.patch("app.tasks._discover_packer_templates",
-                     return_value=[_FakeTemplate("default")])
+        mocker.patch("app.tasks._discover_packer_templates", return_value=[_FakeTemplate("default")])
         _make_openstack_service_mock(mocker, image_exists=False)
         _make_build_lock_mock(mocker, held=True)
         _make_packer_mock(mocker, build=False)
@@ -576,7 +569,7 @@ class TestDeployApplication:
         _make_packer_mock(mocker)
         _make_terraform_executor_mock(mocker)
 
-        SECRET = "SUPER-SECRET-PASSWORD-9999"
+        secret = "SUPER-SECRET-PASSWORD-9999"
         result = deploy_application.run(
             deployment_id="dep-1",
             app_id="myapp",
@@ -586,11 +579,11 @@ class TestDeployApplication:
             teams=None,
             openstack_envelope={
                 "project_id": "p1",
-                "password": SECRET,  # opaque encrypted blob in real life
+                "password": secret,  # opaque encrypted blob in real life
             },
         )
         serialised = json.dumps(result["logs"])
-        assert SECRET not in serialised
+        assert secret not in serialised
 
     def test_variable_encoding_dict_passed_as_json(self, mocker, tmp_path):
         """A dict in user_vars["terraform"] reaches terraform as JSON string."""
@@ -696,17 +689,19 @@ class TestPauseResume:
         _silence_events(mocker, task)
         _make_git_mock(mocker, repo_path)
         _make_clouds_config_mock(mocker)
-        state = json.dumps({
-            "resources": [
-                {
-                    "type": "openstack_compute_instance_v2",
-                    "instances": [
-                        {"attributes": {"id": "srv-1", "name": "web"}},
-                        {"attributes": {"id": "srv-2", "name": "db"}},
-                    ],
-                }
-            ]
-        })
+        state = json.dumps(
+            {
+                "resources": [
+                    {
+                        "type": "openstack_compute_instance_v2",
+                        "instances": [
+                            {"attributes": {"id": "srv-1", "name": "web"}},
+                            {"attributes": {"id": "srv-2", "name": "db"}},
+                        ],
+                    }
+                ]
+            }
+        )
         _make_terraform_executor_mock(mocker, state=state)
         _, os_inst = _make_openstack_service_mock(mocker)
 
@@ -765,15 +760,19 @@ class TestPauseResume:
         _silence_events(mocker, pause_deployment)
         _make_git_mock(mocker, repo_path)
         _make_clouds_config_mock(mocker)
-        state = json.dumps({
-            "resources": [
-                {"type": "openstack_compute_instance_v2",
-                 "instances": [
-                     {"attributes": {"id": "ok-1"}},
-                     {"attributes": {"id": "bad-1"}},
-                 ]}
-            ]
-        })
+        state = json.dumps(
+            {
+                "resources": [
+                    {
+                        "type": "openstack_compute_instance_v2",
+                        "instances": [
+                            {"attributes": {"id": "ok-1"}},
+                            {"attributes": {"id": "bad-1"}},
+                        ],
+                    }
+                ]
+            }
+        )
         _make_terraform_executor_mock(mocker, state=state)
         os_inst = mocker.MagicMock()
         os_inst.server_show.return_value = {"name": "n", "status": "ACTIVE"}

@@ -8,13 +8,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 import app.utils.crypto as crypto_module
-from app.utils.crypto import (
-    InvalidToken,
-    decrypt,
-    decrypt_b64,
-    encrypt,
-    encrypt_b64,
-)
+from app.utils.crypto import InvalidToken, decrypt, decrypt_b64, encrypt, encrypt_b64
 
 
 @pytest.mark.unit
@@ -140,9 +134,7 @@ class TestBuildCipherErrors:
 
     def test_build_cipher_with_malformed_key_raises_runtime_error(self, mocker):
         """_build_cipher wraps Fernet ValueError/TypeError as RuntimeError('malformed')."""
-        mocker.patch.object(
-            crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", "not-a-fernet-key"
-        )
+        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", "not-a-fernet-key")
 
         with pytest.raises(RuntimeError) as exc_info:
             crypto_module._build_cipher()
@@ -157,9 +149,7 @@ class TestBuildCipherErrors:
     def test_build_cipher_accepts_str_key(self, mocker):
         """_build_cipher encodes a str key to bytes before passing to Fernet."""
         new_key = Fernet.generate_key().decode("ascii")
-        mocker.patch.object(
-            crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", new_key
-        )
+        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", new_key)
 
         cipher = crypto_module._build_cipher()
         assert isinstance(cipher, Fernet)
@@ -169,9 +159,7 @@ class TestBuildCipherErrors:
     def test_build_cipher_accepts_bytes_key(self, mocker):
         """_build_cipher passes a bytes key through to Fernet without encoding."""
         new_key = Fernet.generate_key()
-        mocker.patch.object(
-            crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", new_key
-        )
+        mocker.patch.object(crypto_module.settings, "CREDENTIAL_ENCRYPTION_KEY", new_key)
 
         cipher = crypto_module._build_cipher()
         assert isinstance(cipher, Fernet)

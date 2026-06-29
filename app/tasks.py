@@ -13,11 +13,7 @@ from .services import (
     TerraformExecutor,
     git_service,
 )
-from .services.packer_discovery import (
-    PackerTemplateDiscoveryError,
-    _PackerTemplate,
-    _discover_packer_templates,
-)
+from .services.packer_discovery import PackerTemplateDiscoveryError, _discover_packer_templates, _PackerTemplate
 from .utils.logger import LogCategory, get_logger
 
 logger = get_logger(__name__)
@@ -348,9 +344,7 @@ def _phases_for_templates(templates: list[_PackerTemplate]) -> tuple[str, ...]:
     )
     prefix = tuple(_PHASES_WITH_PACKER[:idx])
     suffix = tuple(
-        p
-        for p in _PHASES_WITH_PACKER[idx:]
-        if p not in (PHASE_PACKER_INIT, PHASE_PACKER_VALIDATE, PHASE_PACKER_BUILD)
+        p for p in _PHASES_WITH_PACKER[idx:] if p not in (PHASE_PACKER_INIT, PHASE_PACKER_VALIDATE, PHASE_PACKER_BUILD)
     )
     packer_phases: list[str] = []
     for t in templates:
@@ -695,9 +689,7 @@ def deploy_application(
                 # for a pre-multi app is byte-identical; multi-template
                 # apps get one ``PHASE:<key>`` trio per template.
                 init_phase = PHASE_PACKER_INIT if is_legacy else f"{PHASE_PACKER_INIT}:{tmpl.key}"
-                validate_phase = (
-                    PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
-                )
+                validate_phase = PHASE_PACKER_VALIDATE if is_legacy else f"{PHASE_PACKER_VALIDATE}:{tmpl.key}"
                 build_phase = PHASE_PACKER_BUILD if is_legacy else f"{PHASE_PACKER_BUILD}:{tmpl.key}"
 
                 build_lock = PackerBuildLock(project_id, image_name)
@@ -764,7 +756,7 @@ def deploy_application(
                         # the flat ``user_vars["packer"][var_name]``;
                         # multi shape is nested ``user_vars["packer"][template_key][var_name]``.
                         if is_legacy:
-                            user_packer = user_vars["packer"] if "packer" in user_vars else {}
+                            user_packer = user_vars.get("packer", {})
                         else:
                             user_packer = (user_vars.get("packer") or {}).get(tmpl.key, {}) or {}
                         packer_vars = {**user_packer}
@@ -943,9 +935,7 @@ def deploy_application(
                     # the broken apply would otherwise reject the
                     # cleanup with the same schema error that killed
                     # the apply, leaving orphan OpenStack resources.
-                    cleanup_tf_vars = (
-                        _strip_file_vars(user_vars.get("terraform") or {})
-                    )
+                    cleanup_tf_vars = _strip_file_vars(user_vars.get("terraform") or {})
                     if len(templates) == 1 and templates[0].key == "default":
                         cleanup_tf_vars["image_name"] = image_names["default"]
                     else:
@@ -1681,9 +1671,7 @@ def _build_current_roster(teams: dict[str, list]) -> tuple[set[str], set[str]]:
         if not isinstance(members, list):
             continue
         for member in members:
-            email = member if isinstance(member, str) else (
-                member.get("email") if isinstance(member, dict) else None
-            )
+            email = member if isinstance(member, str) else (member.get("email") if isinstance(member, dict) else None)
             if not email:
                 continue
             user_keys.add(f"{team_name}-{email}")
@@ -1749,9 +1737,7 @@ def _reconcile_scoped_vars_to_roster(
         user_overlap = slot_keys & user_keys
         if slot_keys <= team_keys and team_keys:
             allowed = team_keys
-        elif slot_keys <= user_keys and user_keys:
-            allowed = user_keys
-        elif len(user_overlap) >= len(team_overlap) and user_overlap:
+        elif slot_keys <= user_keys and user_keys or len(user_overlap) >= len(team_overlap) and user_overlap:
             allowed = user_keys
         elif team_overlap:
             allowed = team_keys
@@ -1879,10 +1865,7 @@ def redeploy_resource(
         # we double-check the shape so an empty / malformed string from
         # a misconfigured caller doesn't reach the CLI.
         if not resource_address or not _REDEPLOY_ADDRESS_RE.match(resource_address):
-            raise Exception(
-                f"redeploy_resource called with invalid resource_address: "
-                f"{resource_address!r}"
-            )
+            raise Exception(f"redeploy_resource called with invalid resource_address: " f"{resource_address!r}")
 
         phase_tracker.mark(PHASE_STARTING, f"Starting redeploy of {resource_address}")
         task_logger.resource_info(
@@ -1899,9 +1882,7 @@ def redeploy_resource(
 
         phase_tracker.mark(PHASE_OPENSTACK_SETUP, "Validating OpenStack credentials")
         if not openstack_envelope:
-            raise Exception(
-                "OpenStack credential envelope missing — cannot redeploy without credentials"
-            )
+            raise Exception("OpenStack credential envelope missing — cannot redeploy without credentials")
         task_logger.success("OpenStack credential envelope received", category=LogCategory.STATUS)
 
         phase_tracker.mark(PHASE_GIT_CLONE, "Cloning repository at original release tag")
@@ -1911,9 +1892,7 @@ def redeploy_resource(
             category=LogCategory.OPERATION,
         )
         try:
-            repo_path = git_service.clone_release(
-                git_url=app_git_link, deployment_id=deployment_id, tag=release
-            )
+            repo_path = git_service.clone_release(git_url=app_git_link, deployment_id=deployment_id, tag=release)
             try:
                 import git as _git
 
@@ -1930,9 +1909,7 @@ def redeploy_resource(
                     category=LogCategory.STATUS,
                 )
             except Exception as e:
-                task_logger.warning(
-                    f"Could not extract commit info: {e}", category=LogCategory.WARNING
-                )
+                task_logger.warning(f"Could not extract commit info: {e}", category=LogCategory.WARNING)
         except Exception as e:
             raise Exception(f"Git clone failed: {str(e)}")
 
@@ -1952,9 +1929,7 @@ def redeploy_resource(
         except PackerTemplateDiscoveryError as e:
             raise Exception(f"Packer template discovery failed: {e}")
 
-        image_tag = (
-            commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
-        )
+        image_tag = commit_info["hash"][:8] if commit_info and commit_info.get("hash") else release
         if not templates or (len(templates) == 1 and templates[0].key == "default"):
             image_names = {"default": f"{app_id}-{image_tag}"}
         else:
@@ -1977,9 +1952,7 @@ def redeploy_resource(
         # shifted since (team renames, members added/removed); ship
         # the apply only the slots that still match the *current*
         # roster so terraform doesn't choke on orphan keys.
-        terraform_vars = _reconcile_scoped_vars_to_roster(
-            terraform_vars, teams, task_logger
-        )
+        terraform_vars = _reconcile_scoped_vars_to_roster(terraform_vars, teams, task_logger)
         # Inject the per-template image-name variables (legacy: flat
         # ``image_name``; multi: one ``image_name_<key>`` per template).
         if not templates or (len(templates) == 1 and templates[0].key == "default"):
@@ -2026,13 +1999,9 @@ def redeploy_resource(
         )
         if not success:
             if stdout:
-                task_logger.command_output(
-                    "terraform_apply_stdout", stdout, returncode=1
-                )
+                task_logger.command_output("terraform_apply_stdout", stdout, returncode=1)
             if stderr:
-                task_logger.command_output(
-                    "terraform_apply_stderr", stderr, returncode=1
-                )
+                task_logger.command_output("terraform_apply_stderr", stderr, returncode=1)
             raise Exception("Terraform apply (replace) failed")
         task_logger.success(
             f"Resource {resource_address} replaced",
@@ -2058,9 +2027,7 @@ def redeploy_resource(
         }
 
     except Exception as e:
-        task_logger.exception(
-            f"Redeploy failed: {str(e)}", exception=e, deployment_id=deployment_id
-        )
+        task_logger.exception(f"Redeploy failed: {str(e)}", exception=e, deployment_id=deployment_id)
         if not tf_state:
             tf_state = collect_terraform_state()
         raise Failure(
@@ -2084,10 +2051,6 @@ def redeploy_resource(
         if repo_path:
             try:
                 git_service.cleanup_repository(repo_path)
-                task_logger.success(
-                    "Repository cleanup completed", category=LogCategory.SYSTEM
-                )
+                task_logger.success("Repository cleanup completed", category=LogCategory.SYSTEM)
             except Exception as e:
-                task_logger.warning(
-                    f"Repository cleanup failed: {e}", category=LogCategory.WARNING
-                )
+                task_logger.warning(f"Repository cleanup failed: {e}", category=LogCategory.WARNING)
