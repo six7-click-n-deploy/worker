@@ -1939,14 +1939,18 @@ def redeploy_resource(
         if not os.path.exists(terraform_dir):
             raise Exception(f"Terraform directory not found at {terraform_dir}")
 
-        # Build the terraform var-set exactly like the original
-        # deploy did, but strip file variables — they are pure inputs
-        # to cloud-init and the templates already encode them inside
-        # the state we are recreating, so passing them again would
-        # be redundant and slightly leaky (large base64 blobs land in
-        # the worker log lines).
+        # Build the terraform var-set exactly like the original deploy
+        # did. We KEEP file variables here: ``terraform apply -replace``
+        # destroys the targeted VM and recreates it, so cloud-init runs
+        # fresh and needs the original ``write_files`` payload —
+        # otherwise the replaced VM comes back empty (no assignment
+        # files, no /etc/profile.d snippets, …) even though users and
+        # passwords from the rendered user_data are preserved.
+        #
+        # The backend already pre-filters these vars at dispatch time
+        # for non-recreating lifecycles (destroy/pause/resume) — see
+        # ``_dispatch_lifecycle_task`` in backend/app/routers/deployments.py.
         terraform_vars = {**user_vars["terraform"]} if "terraform" in user_vars else {}
-        terraform_vars = _strip_file_vars(terraform_vars)
         # Bug #9: the original deploy's persisted ``user_vars`` were
         # keyed on the roster at deploy time. Membership may have
         # shifted since (team renames, members added/removed); ship
