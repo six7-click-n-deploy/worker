@@ -7,7 +7,6 @@ import pytest
 
 from app.services.packer_executor import PackerExecutor
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -443,12 +442,7 @@ class TestExtractErrorFromPacker:
 
     def test_joins_first_three_errors_with_pipe(self, executor):
         """When several error lines exist, the first 3 are joined with ' | '."""
-        stderr = (
-            "Error: one\n"
-            "Error: two\n"
-            "Error: three\n"
-            "Error: four\n"
-        )
+        stderr = "Error: one\n" "Error: two\n" "Error: three\n" "Error: four\n"
 
         msg = executor._extract_error_from_packer(stderr)
 
@@ -458,11 +452,7 @@ class TestExtractErrorFromPacker:
 
     def test_fallback_to_last_non_trace_line(self, executor):
         """When no error pattern matched, falls back to last non-TRACE/DEBUG line."""
-        stderr = (
-            "[TRACE] noise\n"
-            "informational message\n"
-            "[TRACE] later noise\n"
-        )
+        stderr = "[TRACE] noise\n" "informational message\n" "[TRACE] later noise\n"
 
         msg = executor._extract_error_from_packer(stderr)
 

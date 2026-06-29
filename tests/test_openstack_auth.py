@@ -9,10 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
-from app.services.openstack_auth import (
-    CredentialEnvelopeError,
-    PerTaskCloudsConfig,
-)
+from app.services.openstack_auth import CredentialEnvelopeError, PerTaskCloudsConfig
 from app.utils.crypto import encrypt_b64
 
 
@@ -136,9 +133,11 @@ class TestApplicationCredentialFlow:
             identifier="my-app-id",
             secret="my-app-secret",
         )
-        with PerTaskCloudsConfig(envelope, work_dir=str(tmp_path)) as _:
-            with open(os.path.join(str(tmp_path), "clouds.yaml")) as f:
-                doc = yaml.safe_load(f)
+        with (
+            PerTaskCloudsConfig(envelope, work_dir=str(tmp_path)) as _,
+            open(os.path.join(str(tmp_path), "clouds.yaml")) as f,
+        ):
+            doc = yaml.safe_load(f)
 
         cloud = doc["clouds"]["openstack"]
         assert cloud["auth_type"] == "v3applicationcredential"
@@ -243,9 +242,8 @@ class TestPasswordAuthFlow:
             user_domain_name="Default",
             project_domain_name="Default",
         )
-        with PerTaskCloudsConfig(envelope, work_dir=str(tmp_path)) as env:
-            with open(env["OS_CLIENT_CONFIG_FILE"]) as f:
-                doc = yaml.safe_load(f)
+        with PerTaskCloudsConfig(envelope, work_dir=str(tmp_path)) as env, open(env["OS_CLIENT_CONFIG_FILE"]) as f:
+            doc = yaml.safe_load(f)
         auth = doc["clouds"]["openstack"]["auth"]
         assert auth["username"] == "bob"
         assert auth["password"] == "pw"

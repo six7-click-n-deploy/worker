@@ -7,7 +7,6 @@ import pytest
 
 from app.services.openstack_service import OpenStackService
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -298,9 +297,7 @@ class TestServerStop:
         """Returns (False, stripped stderr) when stop exits non-zero."""
         mocker.patch(
             "app.services.openstack_service.subprocess.run",
-            return_value=_CompletedStub(
-                returncode=1, stdout="", stderr="  Instance is locked  \n"
-            ),
+            return_value=_CompletedStub(returncode=1, stdout="", stderr="  Instance is locked  \n"),
         )
         ok, err = service.server_stop("srv-1")
         assert ok is False
@@ -348,9 +345,7 @@ class TestServerStart:
         """Returns (False, stripped stderr) when start exits non-zero."""
         mocker.patch(
             "app.services.openstack_service.subprocess.run",
-            return_value=_CompletedStub(
-                returncode=1, stdout="", stderr="\nQuota exceeded\n"
-            ),
+            return_value=_CompletedStub(returncode=1, stdout="", stderr="\nQuota exceeded\n"),
         )
         ok, err = service.server_start("srv-1")
         assert ok is False
